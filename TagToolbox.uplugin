@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Tag Toolbox",
+	"Description": "Gameplay Tag quality-of-life suite: designer-editable tag picker filters on Blueprint variables, project-wide tag colors, an enhanced tag browser with favorites and recents, and a no-load tag usage audit.",
+	"Category": "Editor",
+	"CreatedBy": "Infinite Game Works",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "TagToolbox",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "TagToolboxEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	]
+}
