@@ -3,6 +3,7 @@
 ## Unreleased — targeting v0.1.0
 
 ### Added
+- MIT license; standalone repository documentation (designer guide, architecture) and an in-repo Backlog.md-format backlog, decoupling the plugin from its development host.
 - Tag Browser References pane: selecting a tag lists every asset whose saved data references it (Asset Registry searchable-name metadata — instant, no loads), with an "include child tags" toggle and double-click-to-open. Registry granularity is the asset, not the node inside it.
 - Tag CONTAINER properties get a colored chip strip that collapses past `MaxVisibleTagChips` tags ("+N more" / "Show less") with per-chip remove; the whole strip is the dropdown trigger — click any chip (or the empty row) to open the engine multi-select picker, with the remove/toggle buttons consuming their own clicks. The Gameplay Tag Roots row appears for Blueprint-created container variables too.
 - Tagged graph comments (`bColorizeTaggedGraphComments`, default on): a comment box whose text carries a `#Some.Tag` token naming a registered tag is tinted with that tag's registry color when the graph builds its widgets — comment groups recolor from one place, nothing is dirtied, and stamped colors render for teammates without the plugin.

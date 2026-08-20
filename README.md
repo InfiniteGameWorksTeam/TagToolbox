@@ -40,4 +40,14 @@ git clone https://github.com/InfiniteGameWorksTeam/TagToolbox.git Plugins/TagToo
 | Module | Type | Purpose |
 |--------|------|---------|
 | `TagToolbox` | Runtime | `UTagToolboxSettings` — the tag styles registry and plugin options. No gameplay behavior. |
-| `TagToolboxEditor` | Editor | Variable tag-filter customization, colored tag pill, Tag Browser, Tag Audit. |
+| `TagToolboxEditor` | Editor | Variable tag-filter customization, colored tag pill + container chips, enhanced dropdown picker, Tag Browser with References, Tag Audit, tagged graph comments. |
+
+## Documentation
+
+- [Designer Guide](docs/designer-guide.md) — every feature, from a user's chair.
+- [Architecture](docs/architecture.md) — modules, verified engine seams, design rules, cross-version gates.
+- [Backlog](backlog/tasks/) — the roadmap, in Backlog.md format.
+
+## License
+
+[MIT](LICENSE).
