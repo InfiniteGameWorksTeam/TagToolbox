@@ -25,6 +25,7 @@ public class TagToolboxEditor : ModuleRules
 			"BlueprintGraph",
 			"GameplayTagsEditor",
 			"InputCore",
+			"Json",
 			"Kismet",
 			"Projects",
 			"PropertyEditor",
