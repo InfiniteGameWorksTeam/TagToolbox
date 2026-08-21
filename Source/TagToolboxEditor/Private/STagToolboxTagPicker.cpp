@@ -134,6 +134,50 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
 			.VAlign(VAlign_Center)
 			[
+				SNew(SCheckBox)
+				.Visibility(IsSelectionMode() ? EVisibility::Collapsed : EVisibility::Visible)
+				.IsEnabled_Lambda([]() { return FTagToolboxTagScanService::Get().GetState() != ETagToolboxScanState::NeverScanned; })
+				.IsChecked_Lambda([this]() { return bSortByUsage ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.OnCheckStateChanged_Lambda([this](ECheckBoxState NewState)
+				{
+					bSortByUsage = (NewState == ECheckBoxState::Checked);
+					RebuildVisibility();
+				})
+				.ToolTipText(LOCTEXT("SortByUsageToolTip", "Order siblings by usage (subtree-aggregate count, so a heavily-used leaf lifts its parents). Disabled until a usage scan has run."))
+				[
+					SNew(STextBlock)
+					.Text(LOCTEXT("SortByUsage", "Sort: Usage"))
+				]
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+			.VAlign(VAlign_Center)
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+				.Visibility(IsSelectionMode() ? EVisibility::Collapsed : EVisibility::Visible)
+				.ToolTipText(LOCTEXT("CountUsageToolTip", "Scan the Asset Registry's saved tag references and show per-tag usage counts. Explicit — the scan never runs on its own, and counts go stale (never wrong) when tags or content change."))
+				.OnClicked_Lambda([this]()
+				{
+					FTagToolboxTagScanService::Get().RunScan(/*bAllowDialog=*/true);
+					return FReply::Handled();
+				})
+				[
+					SNew(STextBlock)
+					.Text_Lambda([]()
+					{
+						return FTagToolboxTagScanService::Get().GetState() == ETagToolboxScanState::Stale
+							? LOCTEXT("RecountUsage", "Recount (stale)")
+							: LOCTEXT("CountUsage", "Count usage");
+					})
+				]
+			]
+			+ SHorizontalBox::Slot()
+			.AutoWidth()
+			.Padding(8.0f, 0.0f, 0.0f, 0.0f)
+			.VAlign(VAlign_Center)
+			[
 				SNew(SButton)
 				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 				.Visibility(IsSelectionMode() ? EVisibility::Visible : EVisibility::Collapsed)
@@ -283,6 +327,11 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 	];
 
 	TagTreeChangedHandle = UGameplayTagsManager::OnEditorRefreshGameplayTagTree.AddSP(this, &STagToolboxTagPicker::HandleTagTreeChanged);
+	if (!IsSelectionMode())
+	{
+		ScanStateChangedHandle = FTagToolboxTagScanService::Get().OnScanStateChanged.AddSP(this, &STagToolboxTagPicker::HandleScanStateChanged);
+		RebuildUsageAggregates();
+	}
 
 	RebuildTree();
 	RebuildRecentsStrip();
@@ -291,6 +340,105 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 STagToolboxTagPicker::~STagToolboxTagPicker()
 {
 	UGameplayTagsManager::OnEditorRefreshGameplayTagTree.Remove(TagTreeChangedHandle);
+	if (ScanStateChangedHandle.IsValid())
+	{
+		FTagToolboxTagScanService::Get().OnScanStateChanged.Remove(ScanStateChangedHandle);
+	}
+}
+
+void STagToolboxTagPicker::HandleScanStateChanged()
+{
+	RebuildUsageAggregates();
+
+	// Resorting defers one tick: the state change can arrive from inside a
+	// scan or save path, and StableSort keeps the scroll position meaningful.
+	if (bSortByUsage)
+	{
+		TWeakPtr<STagToolboxTagPicker> WeakSelf = SharedThis(this);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakSelf](float)
+		{
+			if (const TSharedPtr<STagToolboxTagPicker> Self = WeakSelf.Pin())
+			{
+				Self->RebuildVisibility();
+			}
+			return false;
+		}));
+	}
+	else
+	{
+		Invalidate(EInvalidateWidgetReason::Paint);
+	}
+}
+
+void STagToolboxTagPicker::RebuildUsageAggregates()
+{
+	const FTagToolboxTagScanService& Service = FTagToolboxTagScanService::Get();
+	UsageAggregates = (Service.GetState() == ETagToolboxScanState::NeverScanned)
+		? TMap<FName, int32>()
+		: BuildUsageAggregates(Service.GetReferencedTagToPackages());
+}
+
+FText STagToolboxTagPicker::GetCountBadgeText(FName CompleteTagName) const
+{
+	const FTagToolboxTagScanService& Service = FTagToolboxTagScanService::Get();
+	switch (Service.GetState())
+	{
+	case ETagToolboxScanState::NeverScanned:
+		return FText::AsCultureInvariant(TEXT("—")); // em-dash: no data, never a confident zero
+	case ETagToolboxScanState::Stale:
+		return FText::Format(LOCTEXT("CountStale", "{0} (stale)"), FText::AsNumber(Service.GetExactUsageCount(CompleteTagName)));
+	default:
+		return FText::AsNumber(Service.GetExactUsageCount(CompleteTagName));
+	}
+}
+
+FText STagToolboxTagPicker::GetCountToolTipText() const
+{
+	switch (FTagToolboxTagScanService::Get().GetState())
+	{
+	case ETagToolboxScanState::NeverScanned:
+		return LOCTEXT("CountToolTipNever", "No usage scan has run this session — press 'Count usage'. Counts are exact-name (children counted separately; the References pane below can include children). Unsaved edits are invisible to any scan.");
+	case ETagToolboxScanState::Stale:
+		return LOCTEXT("CountToolTipStale", "Counts are from the last scan and the tag table or saved content has changed since — press 'Recount'. Counts are exact-name (children counted separately; the References pane below can include children). Unsaved edits are invisible to any scan.");
+	default:
+		return LOCTEXT("CountToolTipFresh", "Saved packages referencing exactly this tag name (children counted separately; the References pane below can include children). Unsaved edits are invisible to any scan.");
+	}
+}
+
+void STagToolboxTagPicker::SortNamesByAggregateUsage(TArray<FName>& Names, const TMap<FName, int32>& AggregateCounts)
+{
+	Names.StableSort([&AggregateCounts](const FName& A, const FName& B)
+	{
+		const int32 CountA = AggregateCounts.FindRef(A);
+		const int32 CountB = AggregateCounts.FindRef(B);
+		if (CountA != CountB)
+		{
+			return CountA > CountB;
+		}
+		return A.LexicalLess(B);
+	});
+}
+
+TMap<FName, int32> STagToolboxTagPicker::BuildUsageAggregates(const TMap<FName, TArray<FName>>& ReferencedTagToPackages)
+{
+	TMap<FName, int32> Aggregates;
+	for (const TPair<FName, TArray<FName>>& Pair : ReferencedTagToPackages)
+	{
+		const int32 ExactCount = Pair.Value.Num();
+		FString NameString = Pair.Key.ToString();
+		while (!NameString.IsEmpty())
+		{
+			int32& Aggregate = Aggregates.FindOrAdd(FName(*NameString));
+			Aggregate = FMath::Max(Aggregate, ExactCount);
+			int32 LastDot = INDEX_NONE;
+			if (!NameString.FindLastChar(TEXT('.'), LastDot))
+			{
+				break;
+			}
+			NameString.LeftInline(LastDot);
+		}
+	}
+	return Aggregates;
 }
 
 void STagToolboxTagPicker::RebuildTree()
@@ -311,6 +459,21 @@ void STagToolboxTagPicker::RebuildVisibility()
 		{
 			VisibleRootNodes.Add(Root);
 		}
+	}
+
+	// U9: the usage lens also orders the ROOTS by subtree-aggregate count.
+	if (bSortByUsage && VisibleRootNodes.Num() > 1)
+	{
+		VisibleRootNodes.StableSort([this](const FTagNodePtr& A, const FTagNodePtr& B)
+		{
+			const int32 CountA = UsageAggregates.FindRef(A->GetCompleteTagName());
+			const int32 CountB = UsageAggregates.FindRef(B->GetCompleteTagName());
+			if (CountA != CountB)
+			{
+				return CountA > CountB;
+			}
+			return A->GetCompleteTagName().LexicalLess(B->GetCompleteTagName());
+		});
 	}
 
 	if (TagTree.IsValid())
@@ -677,6 +840,26 @@ TSharedRef<ITableRow> STagToolboxTagPicker::GenerateRow(FTagNodePtr Node, const 
 			SNew(STextBlock)
 			.Text(FText::FromName(Node->GetSimpleTagName()))
 		]
+
+		// U9: exact-name usage badge (browse mode; paint-time cache lookup,
+		// never a registry query). Em-dash = not scanned; "(stale)" = honest.
+		+ SHorizontalBox::Slot()
+		.AutoWidth()
+		.VAlign(VAlign_Center)
+		.Padding(6.0f, 0.0f, 4.0f, 0.0f)
+		[
+			SNew(STextBlock)
+			.Visibility(IsSelectionMode() ? EVisibility::Collapsed : EVisibility::Visible)
+			.Font(FAppStyle::GetFontStyle("PropertyWindow.NormalFont"))
+			.ColorAndOpacity_Lambda([]()
+			{
+				return FTagToolboxTagScanService::Get().GetState() == ETagToolboxScanState::Stale
+					? FSlateColor(FLinearColor(0.95f, 0.65f, 0.2f))
+					: FSlateColor::UseSubduedForeground();
+			})
+			.Text_Lambda([this, CompleteName]() { return GetCountBadgeText(CompleteName); })
+			.ToolTipText_Lambda([this]() { return GetCountToolTipText(); })
+		]
 	];
 }
 
@@ -692,6 +875,22 @@ void STagToolboxTagPicker::GetChildrenForNode(FTagNodePtr Node, TArray<FTagNodeP
 		{
 			OutChildren.Add(Child);
 		}
+	}
+
+	// U9: the usage lens reorders SIBLINGS at each depth by subtree-aggregate
+	// count, so a hot leaf under a quiet parent still surfaces.
+	if (bSortByUsage && OutChildren.Num() > 1)
+	{
+		OutChildren.StableSort([this](const FTagNodePtr& A, const FTagNodePtr& B)
+		{
+			const int32 CountA = UsageAggregates.FindRef(A->GetCompleteTagName());
+			const int32 CountB = UsageAggregates.FindRef(B->GetCompleteTagName());
+			if (CountA != CountB)
+			{
+				return CountA > CountB;
+			}
+			return A->GetCompleteTagName().LexicalLess(B->GetCompleteTagName());
+		});
 	}
 }
 

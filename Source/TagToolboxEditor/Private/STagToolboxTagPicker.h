@@ -93,6 +93,20 @@ public:
 	SLATE_END_ARGS()
 
 	/**
+	 * Pure usage-sort comparator (U9): descending by aggregate count with a
+	 * lexical name tiebreak. Names absent from the map count zero.
+	 */
+	static void SortNamesByAggregateUsage(TArray<FName>& Names, const TMap<FName, int32>& AggregateCounts);
+
+	/**
+	 * Pure aggregate builder (U9): each exact-count entry max-updates itself
+	 * and every ancestor name, so a high-usage leaf under a quiet parent still
+	 * surfaces when siblings sort by usage. Badges keep showing OWN exact
+	 * counts; aggregates only order the tree.
+	 */
+	static TMap<FName, int32> BuildUsageAggregates(const TMap<FName, TArray<FName>>& ReferencedTagToPackages);
+
+	/**
 	 * The pure create-row decision (U4): every visual state of the inline
 	 * create row derives from this one function so tests can drive it without
 	 * Slate. Validation runs the engine's tag-string check (with its fixed
@@ -201,6 +215,17 @@ private:
 
 	FString SearchString;
 	bool bFavoritesOnly = false;
+
+	/** U9: sort-by-usage lens (browse mode; disabled until a scan exists). */
+	bool bSortByUsage = false;
+	/** Subtree-aggregate counts rebuilt on scan completion / tree rebuild. */
+	TMap<FName, int32> UsageAggregates;
+	FDelegateHandle ScanStateChangedHandle;
+
+	void HandleScanStateChanged();
+	void RebuildUsageAggregates();
+	FText GetCountBadgeText(FName CompleteTagName) const;
+	FText GetCountToolTipText() const;
 
 	/** Complete tag names, persisted per user per project. */
 	TSet<FName> Favorites;
