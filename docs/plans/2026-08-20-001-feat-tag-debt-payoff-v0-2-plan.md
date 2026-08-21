@@ -1,7 +1,7 @@
 ---
 title: 'feat: Tag Toolbox v0.2 — sees debt, pays debt, never regresses'
 type: feat
-status: active
+status: completed
 date: 2026-08-20
 ---
 
