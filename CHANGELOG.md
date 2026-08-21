@@ -1,6 +1,6 @@
 # Tag Toolbox Changelog
 
-## Unreleased — targeting v0.2.0
+## v0.2.0 — 2026-08-21
 
 ### Fixed
 - Tag Audit now aggregates `GameplayTagRedirects` across EVERY tag source list (`Config/Tags/*.ini` included), not just `DefaultGameplayTags.ini`. The engine writes rename redirects to the renamed tag's own source list, so the audit previously misclassified those old names as "referenced but undefined".
