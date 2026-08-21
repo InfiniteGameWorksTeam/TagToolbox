@@ -2,6 +2,13 @@
 
 ## Unreleased — targeting v0.2.0
 
+### Fixed
+- Tag Audit now aggregates `GameplayTagRedirects` across EVERY tag source list (`Config/Tags/*.ini` included), not just `DefaultGameplayTags.ini`. The engine writes rename redirects to the renamed tag's own source list, so the audit previously misclassified those old names as "referenced but undefined".
+
+### Added
+- Shared tag scan service: one session-cached Asset-Registry usage scan (explicit-run-only, honestly-stale on tag or content changes) behind the audit — and the foundation for Browser usage counts, rename fix-up, and the CI commandlet.
+- Destructive-flow engine characterization recorded in `docs/architecture.md` (rename/delete/redirect/reload/rollback semantics, verified against UE 5.8 source plus a live probe run).
+
 ## v0.1.0 — 2026-08-20
 
 ### Added

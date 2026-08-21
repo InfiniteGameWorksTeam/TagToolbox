@@ -5,12 +5,15 @@
 #include "AssetRegistry/AssetIdentifier.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
+#include "Containers/Ticker.h"
 #include "Editor.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "GameplayTagsEditorModule.h"
 #include "GameplayTagsManager.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "Misc/ConfigCacheIni.h"
+#include "TagToolboxTagClipboard.h"
 #include "Styling/AppStyle.h"
 #include "TagToolboxColorBridge.h"
 #include "TagToolboxSettings.h"
@@ -65,6 +68,7 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 	OnTagSelected = InArgs._OnTagSelected;
 	CurrentTag = InArgs._CurrentTag;
 	bMenuHosted = InArgs._MenuHosted;
+	CanCreateTags = InArgs._CanCreateTags;
 
 	LoadPersistedState();
 
@@ -102,7 +106,7 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 			+ SHorizontalBox::Slot()
 			.FillWidth(1.0f)
 			[
-				SNew(SSearchBox)
+				SAssignNew(SearchBox, SSearchBox)
 				.HintText(LOCTEXT("SearchHint", "Search tags..."))
 				.OnTextChanged(this, &STagToolboxTagPicker::HandleSearchChanged)
 			]
@@ -141,6 +145,55 @@ void STagToolboxTagPicker::Construct(const FArguments& InArgs)
 				[
 					SNew(STextBlock)
 					.Text(LOCTEXT("Clear", "Clear"))
+				]
+			]
+		]
+
+		// Inline create/reveal row (mirrors the engine picker's add-row slot):
+		// drives entirely off CreateRowPlan, whose modes are pure-derived.
+		+ SVerticalBox::Slot()
+		.AutoHeight()
+		.Padding(4.0f, 0.0f, 4.0f, 4.0f)
+		[
+			SNew(SBorder)
+			.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+			.Visibility_Lambda([this]()
+			{
+				return CreateRowPlan.Mode == ETagToolboxCreateRowMode::Hidden ? EVisibility::Collapsed : EVisibility::Visible;
+			})
+			.Padding(FMargin(4.0f, 2.0f))
+			[
+				SNew(SButton)
+				.ButtonStyle(FAppStyle::Get(), "SimpleButton")
+				.IsEnabled_Lambda([this]()
+				{
+					return CreateRowPlan.Mode == ETagToolboxCreateRowMode::Offer || CreateRowPlan.Mode == ETagToolboxCreateRowMode::ExistsHidden;
+				})
+				.ToolTipText_Lambda([this]() { return CreateRowPlan.Reason; })
+				.OnClicked(this, &STagToolboxTagPicker::ExecuteCreateRowAction)
+				[
+					SNew(STextBlock)
+					.Font(FAppStyle::GetFontStyle("PropertyWindow.NormalFont"))
+					.Text_Lambda([this]()
+					{
+						switch (CreateRowPlan.Mode)
+						{
+						case ETagToolboxCreateRowMode::Offer:
+							return FText::Format(LOCTEXT("CreateRowOffer", "+ Create tag '{0}'"), FText::AsCultureInvariant(CreateRowPlan.FinalTagString));
+						case ETagToolboxCreateRowMode::ExistsHidden:
+							return FText::Format(LOCTEXT("CreateRowReveal", "'{0}' exists — show it"), FText::AsCultureInvariant(CreateRowPlan.FinalTagString));
+						case ETagToolboxCreateRowMode::ExistsBlockedByFilter:
+						case ETagToolboxCreateRowMode::InvalidInput:
+							return CreateRowPlan.Reason;
+						default:
+							return FText::GetEmpty();
+						}
+					})
+					.ColorAndOpacity_Lambda([this]()
+					{
+						const bool bActionable = CreateRowPlan.Mode == ETagToolboxCreateRowMode::Offer || CreateRowPlan.Mode == ETagToolboxCreateRowMode::ExistsHidden;
+						return bActionable ? FSlateColor::UseForeground() : FSlateColor::UseSubduedForeground();
+					})
 				]
 			]
 		]
@@ -282,6 +335,217 @@ void STagToolboxTagPicker::RebuildVisibility()
 			}
 		}
 	}
+
+	RefreshCreateRowPlan();
+}
+
+FTagToolboxCreateRowPlan STagToolboxTagPicker::BuildCreateRowPlan(
+	const FString& SearchText,
+	const FString& RootFilter,
+	bool bTagExists,
+	bool bExistingVisibleInView,
+	bool bExistingAllowedByFilter,
+	bool bCanCreateTags,
+	bool bTagSourcesWritable,
+	bool bCreateInFlight,
+	const FString& ExistingResolvedName)
+{
+	FTagToolboxCreateRowPlan Plan;
+
+	const FString Trimmed = SearchText.TrimStartAndEnd();
+	if (Trimmed.IsEmpty())
+	{
+		return Plan; // Nothing was typed — nothing to offer or explain.
+	}
+
+	if (bTagExists)
+	{
+		if (bExistingVisibleInView)
+		{
+			return Plan; // The user can already see and click it.
+		}
+		if (bExistingAllowedByFilter)
+		{
+			// Hidden by the soft favorites lens, a stale search string, or a
+			// redirect whose target the search text no longer matches — all
+			// revealable through the existing SelectAndRevealTag primitive.
+			Plan.Mode = ETagToolboxCreateRowMode::ExistsHidden;
+			Plan.FinalTagString = ExistingResolvedName.IsEmpty() ? Trimmed : ExistingResolvedName;
+			Plan.Reason = LOCTEXT("CreateRowRevealTip", "The tag exists but is hidden by the current view. Click to reveal it.");
+			return Plan;
+		}
+		// Blocked by the property's hard Categories filter: correctly
+		// unreachable from this picker — say so, offer nothing.
+		Plan.Mode = ETagToolboxCreateRowMode::ExistsBlockedByFilter;
+		Plan.FinalTagString = ExistingResolvedName.IsEmpty() ? Trimmed : ExistingResolvedName;
+		Plan.Reason = FText::Format(LOCTEXT("CreateRowBlocked", "'{0}' exists but is outside this property's filter ({1})."),
+			FText::AsCultureInvariant(Plan.FinalTagString), FText::AsCultureInvariant(RootFilter));
+		return Plan;
+	}
+
+	if (!bTagSourcesWritable || !bCanCreateTags)
+	{
+		return Plan; // Creation unavailable: mirror the engine (no add row at all).
+	}
+
+	if (bCreateInFlight)
+	{
+		Plan.Mode = ETagToolboxCreateRowMode::InvalidInput;
+		Plan.Reason = LOCTEXT("CreateRowInFlight", "A tag is being created...");
+		return Plan;
+	}
+
+	// Out-of-filter input becomes a filter-root-prefixed offer: creating a
+	// value the property can never hold, from the property's own picker, is a
+	// footgun rather than a feature.
+	FString Candidate = Trimmed;
+	if (!RootFilter.IsEmpty() && !FTagToolboxTagClipboard::NameMatchesFilter(Candidate, RootFilter))
+	{
+		TArray<FString> Roots;
+		RootFilter.ParseIntoArray(Roots, TEXT(","), /*bCullEmpty=*/true);
+		if (Roots.Num() > 0)
+		{
+			Candidate = Roots[0].TrimStartAndEnd() + TEXT(".") + Trimmed;
+		}
+	}
+
+	FText ValidationError;
+	FString FixedString;
+	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
+	if (Manager.IsValidGameplayTagString(Candidate, &ValidationError, &FixedString))
+	{
+		Plan.Mode = ETagToolboxCreateRowMode::Offer;
+		Plan.FinalTagString = Candidate;
+		Plan.Reason = LOCTEXT("CreateRowOfferTip", "Create this tag in the project's tag list and select it.");
+		return Plan;
+	}
+
+	// Adopt the engine's fixed-string suggestion when it is itself valid —
+	// the offer then names exactly what will be created.
+	if (!FixedString.IsEmpty() && FixedString != Candidate && Manager.IsValidGameplayTagString(FixedString, nullptr, nullptr))
+	{
+		Plan.Mode = ETagToolboxCreateRowMode::Offer;
+		Plan.FinalTagString = FixedString;
+		Plan.Reason = FText::Format(LOCTEXT("CreateRowFixedTip", "'{0}' is not a valid tag name; this creates '{1}' instead."),
+			FText::AsCultureInvariant(Candidate), FText::AsCultureInvariant(FixedString));
+		return Plan;
+	}
+
+	// Malformed input renders a visible disabled row carrying the specific
+	// reason — never a bare absence (the R3 "never silently dropped" rule).
+	Plan.Mode = ETagToolboxCreateRowMode::InvalidInput;
+	Plan.Reason = FText::Format(LOCTEXT("CreateRowInvalid", "Cannot create '{0}': {1}"),
+		FText::AsCultureInvariant(Candidate), ValidationError);
+	return Plan;
+}
+
+void STagToolboxTagPicker::RefreshCreateRowPlan()
+{
+	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
+
+	const FString Trimmed = SearchString.TrimStartAndEnd();
+	bool bTagExists = false;
+	bool bExistingVisibleInView = false;
+	bool bExistingAllowedByFilter = false;
+	FString ExistingResolvedName;
+
+	if (!Trimmed.IsEmpty())
+	{
+		// RequestGameplayTag applies redirects before dictionary lookup, so a
+		// typed OLD name resolves to its target — the row must never offer to
+		// re-create a redirected name.
+		const FGameplayTag Existing = FGameplayTag::RequestGameplayTag(FName(*Trimmed), /*ErrorIfNotFound=*/false);
+		if (Existing.IsValid())
+		{
+			bTagExists = true;
+			ExistingResolvedName = Existing.GetTagName().ToString();
+			bExistingAllowedByFilter = FTagToolboxTagClipboard::NameMatchesFilter(ExistingResolvedName, RootFilter);
+			if (const TSharedPtr<FGameplayTagNode> Node = Manager.FindTagNode(Existing.GetTagName()))
+			{
+				bExistingVisibleInView = VisibleNodes.Contains(Node.Get());
+			}
+		}
+	}
+
+	CreateRowPlan = BuildCreateRowPlan(
+		SearchString,
+		RootFilter,
+		bTagExists,
+		bExistingVisibleInView,
+		bExistingAllowedByFilter,
+		CanCreateTags.Get(true),
+		Manager.ShouldImportTagsFromINI(),
+		bCreateInFlight,
+		ExistingResolvedName);
+}
+
+FReply STagToolboxTagPicker::ExecuteCreateRowAction()
+{
+	if (CreateRowPlan.Mode == ETagToolboxCreateRowMode::ExistsHidden)
+	{
+		SelectAndRevealTag(FName(*CreateRowPlan.FinalTagString));
+		return FReply::Handled();
+	}
+
+	if (CreateRowPlan.Mode != ETagToolboxCreateRowMode::Offer || bCreateInFlight)
+	{
+		return FReply::Handled();
+	}
+
+	// Capture everything the post-create commit needs BEFORE the engine call:
+	// the ini checkout can steal focus and dismiss a menu host mid-create, and
+	// the commit must not depend on this widget surviving. The delegate copy
+	// is SP-bound to the property customization, so a dead owner is a no-op.
+	const FString FinalName = CreateRowPlan.FinalTagString;
+	const FOnTagSelected CommitCopy = OnTagSelected;
+	const bool bSelectionMode = IsSelectionMode();
+	TWeakPtr<STagToolboxTagPicker> WeakSelf = SharedThis(this);
+
+	bCreateInFlight = true;
+	RefreshCreateRowPlan();
+
+	const bool bAdded = IGameplayTagsEditorModule::Get().AddNewGameplayTagToINI(FinalName);
+	// The engine call is synchronous (its tag-tree refresh already ran and
+	// HandleTagTreeChanged cleared the flag); a failed create clears it here
+	// so the row never latches dead. The engine has already shown the reason.
+	bCreateInFlight = false;
+
+	if (!bAdded)
+	{
+		RefreshCreateRowPlan();
+		return FReply::Handled();
+	}
+
+	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		[CommitCopy, FinalName, bSelectionMode, WeakSelf](float)
+		{
+			const FGameplayTag NewTag = FGameplayTag::RequestGameplayTag(FName(*FinalName), /*ErrorIfNotFound=*/false);
+			if (bSelectionMode && NewTag.IsValid())
+			{
+				CommitCopy.ExecuteIfBound(NewTag);
+			}
+			if (const TSharedPtr<STagToolboxTagPicker> Self = WeakSelf.Pin())
+			{
+				// Search resets to the created name so the row never re-offers
+				// a tag that now exists; browse mode also reveals it.
+				if (Self->SearchBox.IsValid())
+				{
+					Self->SearchBox->SetText(FText::AsCultureInvariant(FinalName));
+				}
+				else
+				{
+					Self->SearchString = FinalName;
+					Self->RebuildVisibility();
+				}
+				if (!bSelectionMode && NewTag.IsValid())
+				{
+					Self->SelectAndRevealTag(NewTag.GetTagName());
+				}
+			}
+			return false; // one-shot
+		}));
+
+	return FReply::Handled();
 }
 
 bool STagToolboxTagPicker::BuildVisibilityRecursive(const FTagNodePtr& Node)
@@ -512,6 +776,10 @@ void STagToolboxTagPicker::HandleSearchChanged(const FText& NewText)
 
 void STagToolboxTagPicker::HandleTagTreeChanged()
 {
+	// A tree refresh means any in-flight create has completed its synchronous
+	// engine path — the row must never stay latched disabled past it.
+	bCreateInFlight = false;
+
 	// The manager rebuilt its node tree; every cached node pointer is stale —
 	// including any the tree view still holds as its selection.
 	if (TagTree.IsValid())

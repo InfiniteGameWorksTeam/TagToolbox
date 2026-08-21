@@ -11,7 +11,34 @@
 
 struct FGameplayTagNode;
 class SHorizontalBox;
+class SSearchBox;
 class STextBlock;
+
+/** What the picker's inline create row shows for the current search text. */
+enum class ETagToolboxCreateRowMode : uint8
+{
+	/** No row (empty search, tag visible, or creation unavailable). */
+	Hidden,
+	/** Clickable: create FinalTagString in place. */
+	Offer,
+	/** Clickable: the tag exists but is hidden (lens/search/redirect target) — reveal it. */
+	ExistsHidden,
+	/** Non-actionable: the tag exists but the property's hard Categories filter excludes it. */
+	ExistsBlockedByFilter,
+	/** Non-actionable: the input cannot become a tag; Reason says why. */
+	InvalidInput,
+};
+
+/** One evaluated create-row decision. Built pure so every state is testable. */
+struct FTagToolboxCreateRowPlan
+{
+	ETagToolboxCreateRowMode Mode = ETagToolboxCreateRowMode::Hidden;
+	/** Offer: the (possibly fixed / filter-prefixed) name to create — also the
+	 *  post-create search text. ExistsHidden: the resolved name to reveal. */
+	FString FinalTagString;
+	/** Human-readable cause for the non-actionable modes. */
+	FText Reason;
+};
 
 /**
  * The Tag Toolbox tag tree, built from scratch over UGameplayTagsManager's
@@ -40,6 +67,7 @@ public:
 		: _Filter()
 		, _MenuHosted(false)
 		, _MaxHeight(0.0f)
+		, _CanCreateTags(true)
 	{}
 		/** Comma-delimited root-tag names to restrict the tree to (Categories format). */
 		SLATE_ARGUMENT(FString, Filter)
@@ -55,7 +83,35 @@ public:
 
 		/** Caps the tree height (0 = uncapped). Set when hosting in a menu. */
 		SLATE_ARGUMENT(float, MaxHeight)
+
+		/**
+		 * Gate for the inline create row's Offer mode (the pill passes the
+		 * property's editability; browse mode leaves it true). The row is
+		 * additionally gated on ShouldImportTagsFromINI().
+		 */
+		SLATE_ATTRIBUTE(bool, CanCreateTags)
 	SLATE_END_ARGS()
+
+	/**
+	 * The pure create-row decision (U4): every visual state of the inline
+	 * create row derives from this one function so tests can drive it without
+	 * Slate. Validation runs the engine's tag-string check (with its fixed
+	 * suggestion adopted when valid); out-of-filter input is offered as a
+	 * filter-root-prefixed name, never as a bare tag the property could not
+	 * hold. Malformed non-empty input always yields a visible InvalidInput row
+	 * carrying the specific reason (the "never silently dropped" rule);
+	 * whitespace-only input hides the row (nothing was typed).
+	 */
+	static FTagToolboxCreateRowPlan BuildCreateRowPlan(
+		const FString& SearchText,
+		const FString& RootFilter,
+		bool bTagExists,
+		bool bExistingVisibleInView,
+		bool bExistingAllowedByFilter,
+		bool bCanCreateTags,
+		bool bTagSourcesWritable,
+		bool bCreateInFlight,
+		const FString& ExistingResolvedName);
 
 	void Construct(const FArguments& InArgs);
 	virtual ~STagToolboxTagPicker() override;
@@ -77,6 +133,11 @@ private:
 
 	void HandleSearchChanged(const FText& NewText);
 	void HandleTagTreeChanged();
+
+	/** Re-derives CreateRowPlan from the live tree/search/filter state. */
+	void RefreshCreateRowPlan();
+	/** Executes the plan's clickable modes (create, or reveal a hidden tag). */
+	FReply ExecuteCreateRowAction();
 
 	bool IsFavorite(const FTagNodePtr& Node) const;
 	void ToggleFavorite(FTagNodePtr Node);
@@ -107,7 +168,19 @@ private:
 
 	TSharedPtr<STreeView<FTagNodePtr>> TagTree;
 	TSharedPtr<SHorizontalBox> RecentsStrip;
+	TSharedPtr<SSearchBox> SearchBox;
 	TSharedPtr<SListView<TSharedPtr<FAssetData>>> ReferencesList;
+
+	/** The current inline create-row decision (see BuildCreateRowPlan). */
+	FTagToolboxCreateRowPlan CreateRowPlan;
+	/** Editability gate supplied by the hosting property (browse mode: true). */
+	TAttribute<bool> CanCreateTags;
+	/**
+	 * True from the moment an engine create is invoked until its synchronous
+	 * tag-tree refresh lands (or the call returns false). A failed create
+	 * clears it immediately so the row never latches dead.
+	 */
+	bool bCreateInFlight = false;
 
 	/** Assets referencing the selected tag (browse mode). */
 	TArray<TSharedPtr<FAssetData>> ReferenceRows;

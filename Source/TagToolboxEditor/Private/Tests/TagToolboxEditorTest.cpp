@@ -4,9 +4,12 @@
 #include "GameplayTagsManager.h"
 #include "GameplayTagsSettings.h"
 #include "Misc/AutomationTest.h"
+#include "STagToolboxTagPicker.h"
 #include "TagToolboxAudit.h"
+#include "TagToolboxResaveService.h"
 #include "TagToolboxCommentTint.h"
 #include "TagToolboxSettings.h"
+#include "TagToolboxTagClipboard.h"
 #include "TagToolboxTagScanService.h"
 #include "TagToolboxVariableFilterCustomization.h"
 #include "UObject/UnrealType.h"
@@ -364,6 +367,243 @@ bool FTagToolboxScanCacheStateTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("State stays Stale"), static_cast<int32>(Service.GetState()), static_cast<int32>(ETagToolboxScanState::Stale));
 
 	Service.OnScanStateChanged.Remove(Handle);
+	return true;
+}
+
+namespace
+{
+	// Convenience wrapper: flags default to the common "tag does not exist,
+	// creation available" case so each scenario names only what it varies.
+	FTagToolboxCreateRowPlan TagToolboxTest_Plan(
+		const FString& SearchText,
+		const FString& RootFilter = FString(),
+		bool bTagExists = false,
+		bool bExistingVisibleInView = false,
+		bool bExistingAllowedByFilter = false,
+		bool bCanCreateTags = true,
+		bool bTagSourcesWritable = true,
+		bool bCreateInFlight = false,
+		const FString& ExistingResolvedName = FString())
+	{
+		return STagToolboxTagPicker::BuildCreateRowPlan(SearchText, RootFilter, bTagExists, bExistingVisibleInView,
+			bExistingAllowedByFilter, bCanCreateTags, bTagSourcesWritable, bCreateInFlight, ExistingResolvedName);
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxCreateRowPlanTest,
+	"TagToolbox.Picker.CreateRowPlan",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxCreateRowPlanTest::RunTest(const FString& Parameters)
+{
+	// Nothing typed — no row, no explanation.
+	TestEqual(TEXT("Empty search hides the row"), static_cast<int32>(TagToolboxTest_Plan(TEXT("")).Mode), static_cast<int32>(ETagToolboxCreateRowMode::Hidden));
+	TestEqual(TEXT("Whitespace-only search hides the row"), static_cast<int32>(TagToolboxTest_Plan(TEXT("   ")).Mode), static_cast<int32>(ETagToolboxCreateRowMode::Hidden));
+
+	// Existing-tag states.
+	TestEqual(TEXT("Visible duplicate hides the row"),
+		static_cast<int32>(TagToolboxTest_Plan(TEXT("Combat.Slam"), TEXT(""), /*exists*/true, /*visible*/true, /*allowed*/true).Mode),
+		static_cast<int32>(ETagToolboxCreateRowMode::Hidden));
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.Slam"), TEXT(""), /*exists*/true, /*visible*/false, /*allowed*/true, true, true, false, TEXT("Combat.Slam"));
+		TestEqual(TEXT("Hidden-but-allowed duplicate offers reveal"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::ExistsHidden));
+		TestEqual(TEXT("Reveal targets the resolved name"), Plan.FinalTagString, FString(TEXT("Combat.Slam")));
+	}
+	{
+		// A typed OLD name resolving through a redirect reveals the TARGET.
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.OldName"), TEXT(""), true, false, true, true, true, false, TEXT("Combat.NewName"));
+		TestEqual(TEXT("Redirected duplicate reveals the target name"), Plan.FinalTagString, FString(TEXT("Combat.NewName")));
+	}
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Movement.Dash"), TEXT("Combat"), /*exists*/true, /*visible*/false, /*allowed*/false, true, true, false, TEXT("Movement.Dash"));
+		TestEqual(TEXT("Filter-blocked duplicate is non-actionable"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::ExistsBlockedByFilter));
+		TestFalse(TEXT("Blocked state carries a reason"), Plan.Reason.IsEmpty());
+	}
+
+	// Creation gates.
+	TestEqual(TEXT("Read-only property hides the offer"),
+		static_cast<int32>(TagToolboxTest_Plan(TEXT("Combat.New"), TEXT(""), false, false, false, /*bCanCreateTags=*/false).Mode),
+		static_cast<int32>(ETagToolboxCreateRowMode::Hidden));
+	TestEqual(TEXT("Unwritable tag sources hide the offer"),
+		static_cast<int32>(TagToolboxTest_Plan(TEXT("Combat.New"), TEXT(""), false, false, false, true, /*bTagSourcesWritable=*/false).Mode),
+		static_cast<int32>(ETagToolboxCreateRowMode::Hidden));
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.New"), TEXT(""), false, false, false, true, true, /*bCreateInFlight=*/true);
+		TestEqual(TEXT("In-flight create refuses a second plan"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::InvalidInput));
+	}
+
+	// Plain offer.
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.New"));
+		TestEqual(TEXT("Valid missing tag offers creation"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::Offer));
+		TestEqual(TEXT("Offer carries the typed name"), Plan.FinalTagString, FString(TEXT("Combat.New")));
+	}
+
+	// Filter-root prefixing: out-of-filter input becomes a prefixed offer.
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Dash"), TEXT("Combat"));
+		TestEqual(TEXT("Out-of-filter input offers prefixed name"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::Offer));
+		TestEqual(TEXT("Prefix uses the first filter root"), Plan.FinalTagString, FString(TEXT("Combat.Dash")));
+	}
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Dash"), TEXT("Movement, Combat"));
+		TestEqual(TEXT("Multi-root filter prefixes with its first root"), Plan.FinalTagString, FString(TEXT("Movement.Dash")));
+	}
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.Uppercut"), TEXT("Combat"));
+		TestEqual(TEXT("In-filter input is offered unprefixed"), Plan.FinalTagString, FString(TEXT("Combat.Uppercut")));
+	}
+
+	// Fixed-string adoption: the offer names exactly what will be created.
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("Combat.Dash."));
+		TestEqual(TEXT("Fixable input still offers"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::Offer));
+		TestEqual(TEXT("Offer carries the engine-fixed name"), Plan.FinalTagString, FString(TEXT("Combat.Dash")));
+	}
+
+	// Unfixable input: a visible disabled row with the reason, never absence.
+	// ("..." trims to nothing — the engine's fixed suggestion is empty. Inputs
+	// whose fix is non-empty, like ",,", correctly become fixed-name offers.)
+	{
+		const FTagToolboxCreateRowPlan Plan = TagToolboxTest_Plan(TEXT("..."));
+		TestEqual(TEXT("Unfixable input renders InvalidInput"), static_cast<int32>(Plan.Mode), static_cast<int32>(ETagToolboxCreateRowMode::InvalidInput));
+		TestFalse(TEXT("InvalidInput carries the specific reason"), Plan.Reason.IsEmpty());
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxClipboardTest,
+	"TagToolbox.Clipboard.ClassifyAndFilter",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxClipboardTest::RunTest(const FString& Parameters)
+{
+	// Export shape: the engine chip's plain string; an unset tag is "None".
+	TestEqual(TEXT("Empty tag exports as None"), FTagToolboxTagClipboard::ExportTagString(FGameplayTag()), FString(TEXT("None")));
+
+	// Container recognition runs before import so refusals can name the cause.
+	TestTrue(TEXT("Container export text recognized"), FTagToolboxTagClipboard::LooksLikeContainerText(TEXT("(GameplayTags=((TagName=\"A.B\"),(TagName=\"C\")))")));
+	TestTrue(TEXT("Empty container export recognized"), FTagToolboxTagClipboard::LooksLikeContainerText(TEXT("(GameplayTags=)")));
+	TestTrue(TEXT("Two TagName entries recognized as container"), FTagToolboxTagClipboard::LooksLikeContainerText(TEXT("(TagName=\"A\"),(TagName=\"B\")")));
+	TestFalse(TEXT("Single-tag export is not a container"), FTagToolboxTagClipboard::LooksLikeContainerText(TEXT("(TagName=\"A.B\")")));
+	TestFalse(TEXT("Plain name is not a container"), FTagToolboxTagClipboard::LooksLikeContainerText(TEXT("A.B")));
+
+	FGameplayTag Parsed;
+	TestEqual(TEXT("Empty text classifies Empty"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("  "), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Empty));
+	TestEqual(TEXT("Container text classifies Container"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("(GameplayTags=((TagName=\"A\")))"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Container));
+	TestEqual(TEXT("Garbage classifies Invalid"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("!!not a tag!!"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Invalid));
+	TestEqual(TEXT("Unregistered name classifies Invalid"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("Zzz.NotARealTag.Ever"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Invalid));
+	TestEqual(TEXT("Bare None classifies Invalid (paste never clears implicitly)"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("None"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Invalid));
+
+	// Registered-name parsing needs a real host tag; skip cleanly when absent.
+	const FGameplayTag HostTag = TagToolboxTest_RequestTag(TEXT("Paper2DPlus.Animation"));
+	if (HostTag.IsValid())
+	{
+		TestEqual(TEXT("Plain registered name classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("Paper2DPlus.Animation"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+		TestEqual(TEXT("Plain name parses to the tag"), Parsed, HostTag);
+		TestEqual(TEXT("Export form classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("(TagName=\"Paper2DPlus.Animation\")"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+		TestEqual(TEXT("Export form parses to the tag"), Parsed, HostTag);
+		TestEqual(TEXT("Surrounding whitespace tolerated"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("  Paper2DPlus.Animation  "), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+	}
+	else
+	{
+		AddInfo(TEXT("Skipping registered-name parse checks: Paper2DPlus.Animation is not registered in this host."));
+	}
+
+	// Filter matching (the shared create/paste policy).
+	TestTrue(TEXT("Empty filter allows everything"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Anything.At.All"), TEXT("")));
+	TestTrue(TEXT("Exact root matches"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Combat"), TEXT("Combat")));
+	TestTrue(TEXT("Child matches"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Combat.Heavy"), TEXT("Combat")));
+	TestTrue(TEXT("Deep child matches"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Combat.Heavy.Spin"), TEXT("Combat")));
+	TestFalse(TEXT("Prefix-similar sibling does not match"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("CombatArena"), TEXT("Combat")));
+	TestFalse(TEXT("Out-of-filter does not match"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Movement.Dash"), TEXT("Combat")));
+	TestTrue(TEXT("Multi-root filter with spaces matches second root"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Movement.Dash"), TEXT("Combat, Movement")));
+	TestTrue(TEXT("Filter matching is case-insensitive"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("combat.heavy"), TEXT("Combat")));
+
+	return true;
+}
+
+namespace
+{
+	FTagToolboxPackageFacts TagToolboxTest_Facts(const TCHAR* Package, bool bLoaded, bool bDirty, bool bReadOnly, bool bSourceControl)
+	{
+		FTagToolboxPackageFacts Facts;
+		Facts.PackageName = FName(Package);
+		Facts.bLoaded = bLoaded;
+		Facts.bDirty = bDirty;
+		Facts.bReadOnlyOnDisk = bReadOnly;
+		Facts.bSourceControlActive = bSourceControl;
+		return Facts;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxResavePlanTest,
+	"TagToolbox.Resave.PlanConsentAndReport",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxResavePlanTest::RunTest(const FString& Parameters)
+{
+	// --- Classification of the four package states from supplied facts.
+	TArray<FTagToolboxPackageFacts> Facts;
+	Facts.Add(TagToolboxTest_Facts(TEXT("/Game/NotLoaded"), false, false, false, false));
+	Facts.Add(TagToolboxTest_Facts(TEXT("/Game/LoadedClean"), true, false, false, false));
+	Facts.Add(TagToolboxTest_Facts(TEXT("/Game/LoadedDirty"), true, true, false, false));
+	Facts.Add(TagToolboxTest_Facts(TEXT("/Game/ReadOnly"), false, false, true, false));
+	Facts.Add(TagToolboxTest_Facts(TEXT("/Game/ReadOnlyWithSCC"), false, false, true, true));
+
+	FTagToolboxResavePlan Plan = FTagToolboxResaveService::BuildPlan(Facts);
+	TestEqual(TEXT("Every fact classifies"), Plan.Entries.Num(), 5);
+	if (Plan.Entries.Num() == 5)
+	{
+		TestEqual(TEXT("Not loaded"), static_cast<int32>(Plan.Entries[0].Disposition), static_cast<int32>(ETagToolboxPackageDisposition::NotLoaded));
+		TestTrue(TEXT("Not loaded included"), Plan.Entries[0].bIncluded);
+		TestEqual(TEXT("Loaded clean"), static_cast<int32>(Plan.Entries[1].Disposition), static_cast<int32>(ETagToolboxPackageDisposition::LoadedClean));
+		TestTrue(TEXT("Loaded clean included"), Plan.Entries[1].bIncluded);
+		TestEqual(TEXT("Loaded dirty"), static_cast<int32>(Plan.Entries[2].Disposition), static_cast<int32>(ETagToolboxPackageDisposition::LoadedDirty));
+		TestFalse(TEXT("Dirty excluded by default"), Plan.Entries[2].bIncluded);
+		TestEqual(TEXT("Read-only without provider"), static_cast<int32>(Plan.Entries[3].Disposition), static_cast<int32>(ETagToolboxPackageDisposition::ReadOnlyNoProvider));
+		TestFalse(TEXT("Read-only excluded"), Plan.Entries[3].bIncluded);
+		TestEqual(TEXT("Read-only WITH provider stays checkout-able"), static_cast<int32>(Plan.Entries[4].Disposition), static_cast<int32>(ETagToolboxPackageDisposition::NotLoaded));
+		TestTrue(TEXT("Checkout-able included"), Plan.Entries[4].bIncluded);
+	}
+
+	// --- Dirty consent: only named dirty entries flip; others untouched.
+	FTagToolboxResaveService::ApplyDirtyConsent(Plan, { FName(TEXT("/Game/LoadedDirty")), FName(TEXT("/Game/ReadOnly")) });
+	if (Plan.Entries.Num() == 5)
+	{
+		TestTrue(TEXT("Opted-in dirty becomes included"), Plan.Entries[2].bIncluded);
+		TestFalse(TEXT("Consent never includes read-only entries"), Plan.Entries[3].bIncluded);
+	}
+	TestEqual(TEXT("Included count after consent"), Plan.CountIncluded(), 4);
+
+	// --- Report aggregation, including the cancelled-mid-batch shape: an
+	// included package that neither saved nor failed is UNATTEMPTED.
+	{
+		const TSet<FName> Saved = { FName(TEXT("/Game/NotLoaded")), FName(TEXT("/Game/LoadedClean")) };
+		const TSet<FName> Failed = { FName(TEXT("/Game/LoadedDirty")) };
+		const FTagToolboxResaveReport Report = FTagToolboxResaveService::BuildReport(Plan, Saved, Failed);
+
+		TestEqual(TEXT("Saved set exact"), Report.Saved.Num(), 2);
+		TestEqual(TEXT("Failed set exact"), Report.Failed.Num(), 1);
+		TestEqual(TEXT("Cancelled remainder is unattempted, not failed"), Report.Unattempted.Num(), 1);
+		if (Report.Unattempted.Num() == 1)
+		{
+			TestEqual(TEXT("Unattempted names the never-tried package"), Report.Unattempted[0], FName(TEXT("/Game/ReadOnlyWithSCC")));
+		}
+		TestEqual(TEXT("Skipped names the excluded package"), Report.Skipped.Num(), 1);
+		TestFalse(TEXT("Partial outcome reports not-all-saved"), Report.AllIncludedSaved());
+	}
+
+	// --- Clean outcome and the empty plan.
+	{
+		const TSet<FName> AllSaved = { FName(TEXT("/Game/NotLoaded")), FName(TEXT("/Game/LoadedClean")), FName(TEXT("/Game/LoadedDirty")), FName(TEXT("/Game/ReadOnlyWithSCC")) };
+		const FTagToolboxResaveReport Report = FTagToolboxResaveService::BuildReport(Plan, AllSaved, TSet<FName>());
+		TestTrue(TEXT("All-saved outcome reports clean"), Report.AllIncludedSaved());
+	}
+	{
+		const FTagToolboxResavePlan EmptyPlan = FTagToolboxResaveService::BuildPlan(TArray<FTagToolboxPackageFacts>());
+		TestEqual(TEXT("No facts produce an empty plan"), EmptyPlan.Entries.Num(), 0);
+		TestEqual(TEXT("Empty plan includes nothing"), EmptyPlan.CountIncluded(), 0);
+	}
+
 	return true;
 }
 

@@ -6,7 +6,11 @@
 #include "DetailWidgetRow.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
+#include "Framework/Notifications/NotificationManager.h"
 #include "GameplayTagsManager.h"
+#include "HAL/PlatformApplicationMisc.h"
 #include "IDetailChildrenBuilder.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "PropertyHandle.h"
@@ -17,11 +21,25 @@
 #include "Styling/AppStyle.h"
 #include "TagToolboxColorBridge.h"
 #include "TagToolboxSettings.h"
+#include "TagToolboxTagClipboard.h"
 #include "Widgets/Input/SComboButton.h"
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/Text/STextBlock.h"
 
 #define LOCTEXT_NAMESPACE "TagToolboxTagPillCustomization"
+
+namespace TagToolboxPillInternal
+{
+	// Refusals surface as notifications, never silence — and they name the
+	// actual cause so the user knows what to fix.
+	static void ShowRefusal(const FText& Message)
+	{
+		FNotificationInfo Info(Message);
+		Info.ExpireDuration = 4.0f;
+		FSlateNotificationManager::Get().AddNotification(Info);
+	}
+}
 
 TSharedRef<IPropertyTypeCustomization> FTagToolboxTagPillCustomization::MakeInstance()
 {
@@ -37,6 +55,12 @@ void FTagToolboxTagPillCustomization::CustomizeHeader(TSharedRef<IPropertyHandle
 
 	HeaderRow
 	.FilterString(FText::AsCultureInvariant(GetCurrentTag().ToString()))
+	.CopyAction(FUIAction(
+		FExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::HandleCopyTag),
+		FCanExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::CanCopyTag)))
+	.PasteAction(FUIAction(
+		FExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::HandlePasteTag),
+		FCanExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::CanPasteTag)))
 	.NameContent()
 	[
 		InStructPropertyHandle->CreatePropertyNameWidget()
@@ -55,6 +79,7 @@ void FTagToolboxTagPillCustomization::CustomizeHeader(TSharedRef<IPropertyHandle
 			.BorderImage(&PillBrush)
 			.BorderBackgroundColor(TAttribute<FSlateColor>::CreateSP(this, &FTagToolboxTagPillCustomization::GetPillColor))
 			.Padding(FMargin(6.0f, 2.0f))
+			.OnMouseButtonUp(this, &FTagToolboxTagPillCustomization::HandlePillMouseButtonUp)
 			[
 				SNew(STextBlock)
 				.Font(FAppStyle::GetFontStyle("PropertyWindow.NormalFont"))
@@ -120,13 +145,11 @@ TSharedRef<SWidget> FTagToolboxTagPillCustomization::BuildPickerMenuContent()
 		return SNullWidget::NullWidget;
 	}
 
-	// The manager helper walks parent handles, owner functions, and tag-typed
-	// struct fields; the bare GetMetaData("Categories") silently unfilters
-	// pickers whose filter comes from a parent handle or function parameter.
-	const FString Filter = UGameplayTagsManager::Get().GetCategoriesMetaFromPropertyHandle(StructPropertyHandle);
+	const FString Filter = GetResolvedFilter();
 
 	// The dropdown is Tag Toolbox's own picker: colored rows, favorites, and
-	// one-click recents, all honoring the resolved Categories filter.
+	// one-click recents, all honoring the resolved Categories filter. The
+	// create row's Offer mode gates on the property's editability.
 	return SNew(SBox)
 		.MinDesiredWidth(300.0f)
 		[
@@ -136,10 +159,134 @@ TSharedRef<SWidget> FTagToolboxTagPillCustomization::BuildPickerMenuContent()
 				.Filter(Filter)
 				.MenuHosted(true)
 				.MaxHeight(380.0f)
+				.CanCreateTags(!StructPropertyHandle->IsEditConst())
 				.CurrentTag(TAttribute<FGameplayTag>::CreateSP(this, &FTagToolboxTagPillCustomization::GetCurrentTag))
 				.OnTagSelected(STagToolboxTagPicker::FOnTagSelected::CreateSP(this, &FTagToolboxTagPillCustomization::HandlePickerTagSelected))
 			]
 		];
+}
+
+FString FTagToolboxTagPillCustomization::GetResolvedFilter() const
+{
+	// The manager helper walks parent handles, owner functions, and tag-typed
+	// struct fields; the bare GetMetaData("Categories") silently unfilters
+	// pickers whose filter comes from a parent handle or function parameter.
+	if (StructPropertyHandle.IsValid() && StructPropertyHandle->IsValidHandle())
+	{
+		return UGameplayTagsManager::Get().GetCategoriesMetaFromPropertyHandle(StructPropertyHandle);
+	}
+	return FString();
+}
+
+void FTagToolboxTagPillCustomization::HandleCopyTag() const
+{
+	FPlatformApplicationMisc::ClipboardCopy(*FTagToolboxTagClipboard::ExportTagString(GetCurrentTag()));
+}
+
+bool FTagToolboxTagPillCustomization::CanCopyTag() const
+{
+	return GetCurrentTag().IsValid();
+}
+
+void FTagToolboxTagPillCustomization::HandlePasteTag()
+{
+	FString PastedText;
+	FPlatformApplicationMisc::ClipboardPaste(PastedText);
+
+	FGameplayTag ParsedTag;
+	switch (FTagToolboxTagClipboard::ClassifyClipboardText(PastedText, ParsedTag))
+	{
+	case ETagToolboxClipboardContent::Empty:
+		TagToolboxPillInternal::ShowRefusal(LOCTEXT("PasteEmpty", "Paste failed: the clipboard is empty."));
+		return;
+
+	case ETagToolboxClipboardContent::Container:
+		TagToolboxPillInternal::ShowRefusal(LOCTEXT("PasteContainer", "Paste failed: the clipboard holds a tag CONTAINER, and this property takes a single tag."));
+		return;
+
+	case ETagToolboxClipboardContent::Invalid:
+		TagToolboxPillInternal::ShowRefusal(FText::Format(LOCTEXT("PasteInvalid", "Paste failed: '{0}' is not a registered gameplay tag."),
+			FText::AsCultureInvariant(PastedText.TrimStartAndEnd().Left(64))));
+		return;
+
+	case ETagToolboxClipboardContent::SingleTag:
+	{
+		const FString Filter = GetResolvedFilter();
+		if (!FTagToolboxTagClipboard::NameMatchesFilter(ParsedTag.ToString(), Filter))
+		{
+			// Mirrors the create policy: a value the property can never hold
+			// is refused with the reason, not silently written.
+			TagToolboxPillInternal::ShowRefusal(FText::Format(LOCTEXT("PasteOutsideFilter", "Paste failed: '{0}' is outside this property's filter ({1})."),
+				FText::AsCultureInvariant(ParsedTag.ToString()), FText::AsCultureInvariant(Filter)));
+			return;
+		}
+		// The one commit funnel: engine-identical transaction + write shape,
+		// multi-object edits included.
+		HandlePickerTagSelected(ParsedTag);
+		return;
+	}
+	}
+}
+
+bool FTagToolboxTagPillCustomization::CanPasteTag() const
+{
+	if (!StructPropertyHandle.IsValid() || !StructPropertyHandle->IsValidHandle() || StructPropertyHandle->IsEditConst())
+	{
+		return false;
+	}
+
+	// Probe silently — no notifications, no logging (the row menu calls this
+	// every time it opens).
+	FString PastedText;
+	FPlatformApplicationMisc::ClipboardPaste(PastedText);
+	FGameplayTag ParsedTag;
+	if (FTagToolboxTagClipboard::ClassifyClipboardText(PastedText, ParsedTag) != ETagToolboxClipboardContent::SingleTag)
+	{
+		return false;
+	}
+	return FTagToolboxTagClipboard::NameMatchesFilter(ParsedTag.ToString(), GetResolvedFilter());
+}
+
+void FTagToolboxTagPillCustomization::HandleClearTag()
+{
+	HandlePickerTagSelected(FGameplayTag());
+}
+
+FReply FTagToolboxTagPillCustomization::HandlePillMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() != EKeys::RightMouseButton)
+	{
+		return FReply::Unhandled();
+	}
+
+	// The pill lives in a details row (not an auto-dismissing menu), so
+	// pushing a context menu here is safe. Mirrors the engine chip's RMB menu.
+	FMenuBuilder MenuBuilder(/*bInShouldCloseWindowAfterMenuSelection=*/true, /*InCommandList=*/nullptr);
+	MenuBuilder.AddMenuEntry(
+		NSLOCTEXT("PropertyView", "CopyProperty", "Copy"),
+		LOCTEXT("CopyTagTooltip", "Copy the tag as a plain string."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Copy"),
+		FUIAction(
+			FExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::HandleCopyTag),
+			FCanExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::CanCopyTag)));
+	MenuBuilder.AddMenuEntry(
+		NSLOCTEXT("PropertyView", "PasteProperty", "Paste"),
+		LOCTEXT("PasteTagTooltip", "Paste a tag from the clipboard (plain name or export text)."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Paste"),
+		FUIAction(
+			FExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::HandlePasteTag),
+			FCanExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::CanPasteTag)));
+	MenuBuilder.AddMenuEntry(
+		LOCTEXT("ClearTag", "Clear Gameplay Tag"),
+		FText::GetEmpty(),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "Icons.X"),
+		FUIAction(
+			FExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::HandleClearTag),
+			FCanExecuteAction::CreateSP(this, &FTagToolboxTagPillCustomization::CanCopyTag)));
+
+	const FWidgetPath WidgetPath = MouseEvent.GetEventPath() != nullptr ? *MouseEvent.GetEventPath() : FWidgetPath();
+	FSlateApplication::Get().PushMenu(ComboButton.ToSharedRef(), WidgetPath, MenuBuilder.MakeWidget(), MouseEvent.GetScreenSpacePosition(), FPopupTransitionEffect(FPopupTransitionEffect::ContextMenu));
+	return FReply::Handled();
 }
 
 void FTagToolboxTagPillCustomization::HandlePickerTagSelected(const FGameplayTag& NewTag)

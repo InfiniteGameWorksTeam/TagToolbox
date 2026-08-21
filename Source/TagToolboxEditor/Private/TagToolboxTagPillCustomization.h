@@ -48,6 +48,27 @@ private:
 	/** Commits a picker selection to the property (empty tag = clear) and closes the combo. */
 	void HandlePickerTagSelected(const FGameplayTag& NewTag);
 
+	/** Copy: the plain tag string (the engine chip's clipboard shape). */
+	void HandleCopyTag() const;
+	bool CanCopyTag() const;
+	/**
+	 * Paste: accepts one tag (plain name or export form; redirected old names
+	 * resolve to their target) through the one commit funnel. Refusals notify
+	 * with the actual cause — container-shaped content, unparseable text, or a
+	 * tag outside the property's resolved filter — never silently drop.
+	 */
+	void HandlePasteTag();
+	/** Silent probe for action enablement — no notifications, no logging. */
+	bool CanPasteTag() const;
+
+	/** RMB on the pill: Copy / Paste / Clear, mirroring the engine chip. */
+	FReply HandlePillMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent);
+
+	/** Clear entry: commits the empty tag through the one funnel. */
+	void HandleClearTag();
+
+	FString GetResolvedFilter() const;
+
 	TSharedPtr<IPropertyHandle> StructPropertyHandle;
 	TSharedPtr<SComboButton> ComboButton;
 
