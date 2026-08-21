@@ -18,6 +18,8 @@ If Paper2DPlus is installed, tags without a Tag Toolbox style fall back to Paper
 - **Recent:** chips — your last-used tags, one click to assign. Recents outside the property's filter are hidden.
 - **Clear** empties the value.
 - The picker honors the property's `Categories` filter, including filters inherited from parent properties and function parameters.
+- **Create a tag in place**: type a name that matches nothing and a **+ Create tag '…'** row appears. In a filtered picker an out-of-filter name is offered as a filter-root-prefixed name (the property could never hold the bare one). Invalid input shows *why* it can't be created instead of vanishing; a tag that exists but is hidden by the Favorites lens offers a one-click reveal.
+- **Copy / Paste / Clear** live on the pill's right-click menu (and the row's standard copy/paste actions). Copy writes the plain tag string; paste accepts plain names and engine export text, resolves redirected old names to their target, and *refuses with the reason* — container-shaped clipboard, unparseable text, or a tag outside the property's filter — never silently.
 
 ## Tag container properties
 
@@ -37,7 +39,11 @@ Filters guide the picker only — Blueprint logic can still assign any tag. Pair
 
 ## Tag Browser (Tools → Tag Browser)
 
-The whole tag tree with colors, search, favorites, and recents. Right-click a row for **Copy Tag Name**, **Set Color… / Clear Color**, and favorites. The bottom **References** pane lists every asset whose *saved* data uses the selected tag — instant, no loading — with an **Include child tags** toggle and double-click-to-open. It points at the asset, not the node inside it.
+The whole tag tree with colors, search, favorites, and recents. Right-click a row for **Copy Tag Name**, **Rename Tag (fix up assets)…**, **Set Color… / Clear Color**, and favorites. The bottom **References** pane lists every asset whose *saved* data uses the selected tag — instant, no loading — with an **Include child tags** toggle and double-click-to-open. It points at the asset, not the node inside it.
+
+**Usage counts**: press **Count usage** to scan once and put an exact-name count on every row. Counts are honest in three states — a number, an em-dash (never scanned: no data, not "zero"), and "N (stale)" after tags or content change (press **Recount**). **Sort: Usage** orders siblings by their subtree's heaviest use, so a hot leaf lifts its quiet parents. Counts are exact-name (children count separately; the References pane can include children) and unsaved edits are invisible to any scan.
+
+**Rename Tag (fix up assets)…** is the flow the engine never had: type the new name and the dialog previews the whole subtree, every referencing package (with loaded/unsaved/read-only status), and what it *cannot* fix (Blueprint variable picker filters, C++ literals, plain-string configs — saved tag, container, and query properties ARE covered). Renaming onto an existing tag warns that the two identities merge; renaming into your own subtree, onto a currently-redirected name, or with a read-only source is refused with the reason. Apply writes the redirects, fixes your styles/favorites/recents, resaves the referencers under a consent dialog (packages with unsaved edits are included only if you tick them — they're saved first so your edits survive), re-checks the old names, and offers to retire the now-unneeded redirects. If anything fails part-way, redirects stay in place and **running the same rename again resumes the fix-up** where it left off.
 
 Console: `TagToolbox.OpenTagBrowser`.
 
@@ -54,6 +60,17 @@ Press **Run Audit** (it never runs on its own) for a no-asset-load report:
 | Lingering Redirect | An old name still referenced — the listed packages need a resave to retire the redirect |
 
 Select a row to see the referencing packages. Known blind spots: C++ `RequestGameplayTag` call sites, tags stored as plain strings, and unsaved edits — the registry only knows saved data.
+
+Findings are now fixable in place (rows are multi-select; every action confirms first):
+
+- **Delete Unused…** removes the selected unused tags from their ini lists and reports exactly which were deleted and which the engine refused (still referenced, or implicit through children).
+- **Create Redirect…** (one Undefined row at a time) picks a defined target and writes the `GameplayTagRedirects` entry so old saved references resolve again. Targets that are undefined, self, or themselves redirected old names are refused with the reason.
+- **Resave Referencers…** (Lingering Redirect rows) rewrites the referencing packages to the new names under the same consent dialog the rename uses — once nothing references an old name, its redirect can be retired.
+- Right-click a redirect row for **Resume rename fix-up…** — the recovery entry for a rename that never finished its resave.
+
+A **results are stale** banner appears whenever the tag table or saved content changes after a run; re-run before acting on old rows.
+
+**CI**: `scripts/run-tagtoolbox-tag-audit.ps1` runs the same audit headless (`-run=TagToolboxTagAudit`) and fails the build on referenced-but-undefined tags (exit 0 clean / 1 findings / 2 infrastructure, verdict read fail-closed from the JSON report — never from the editor's own exit code). Switches escalate the other categories; engine/plugin content is out of scope unless widened.
 
 Console: `TagToolbox.OpenTagAudit`.
 
