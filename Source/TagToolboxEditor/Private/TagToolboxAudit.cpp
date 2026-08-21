@@ -2,20 +2,14 @@
 
 #include "TagToolboxAudit.h"
 
-#include "AssetRegistry/AssetIdentifier.h"
-#include "AssetRegistry/IAssetRegistry.h"
 #include "GameplayTagsEditorModule.h"
 #include "GameplayTagsManager.h"
-#include "GameplayTagsSettings.h"
-#include "Misc/ScopedSlowTask.h"
+#include "TagToolboxTagScanService.h"
 
 #define LOCTEXT_NAMESPACE "TagToolboxAudit"
 
 namespace TagToolboxAuditInternal
 {
-	static const FName GameplayTagsScriptPackage(TEXT("/Script/GameplayTags"));
-	static const FName GameplayTagStructName(TEXT("GameplayTag"));
-
 	static void SortNames(TArray<FName>& Names)
 	{
 		Names.Sort(FNameLexicalLess());
@@ -110,14 +104,13 @@ bool FTagToolboxAudit::AreNamesNearDuplicate(const FString& A, const FString& B)
 	return true;
 }
 
-TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit()
+TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDialog)
 {
 	using namespace TagToolboxAuditInternal;
 
 	TArray<TSharedPtr<FTagToolboxAuditRow>> Rows;
 
 	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
-	IAssetRegistry& AssetRegistry = IAssetRegistry::GetChecked();
 
 	// --- Defined tags (full set, implicit parents included: a referenced
 	// parent that exists only implicitly is not "undefined").
@@ -131,46 +124,26 @@ TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit()
 		}
 	}
 
-	// --- Redirects (default settings list; per-source tag lists with their own
-	// redirects are a known v1 gap).
+	// --- Redirects aggregated across EVERY tag source list. The engine writes
+	// rename redirects to the OLD tag's source list, so a settings-only read
+	// (the v0.1 behavior) misses them. First record wins when the same old
+	// name appears in more than one list.
 	TMap<FName, FName> RedirectOldToNew;
-	for (const FGameplayTagRedirect& Redirect : GetDefault<UGameplayTagsSettings>()->GameplayTagRedirects)
+	for (const FTagToolboxRedirectRecord& Record : FTagToolboxTagScanService::CollectAllRedirects())
 	{
-		RedirectOldToNew.Add(Redirect.OldTagName, Redirect.NewTagName);
+		if (!RedirectOldToNew.Contains(Record.OldTagName))
+		{
+			RedirectOldToNew.Add(Record.OldTagName, Record.NewTagName);
+		}
 	}
 	TSet<FName> RedirectOldNames;
 	RedirectOldToNew.GetKeys(RedirectOldNames);
 
-	// --- Referenced tags from Asset Registry SearchableName dependencies.
-	// Metadata only — no asset ever loads.
-	TSet<FName> AllPackages;
-	AssetRegistry.EnumerateAllAssets([&AllPackages](const FAssetData& AssetData)
-	{
-		AllPackages.Add(AssetData.PackageName);
-		return true;
-	});
-
-	TMap<FName, TArray<FName>> ReferencedTagToPackages;
-	{
-		FScopedSlowTask SlowTask(static_cast<float>(AllPackages.Num()), LOCTEXT("ScanningPackages", "Tag Audit: scanning Asset Registry tag references..."));
-		SlowTask.MakeDialog(/*bShowCancelButton=*/false);
-
-		TArray<FAssetIdentifier> Dependencies;
-		for (const FName& PackageName : AllPackages)
-		{
-			SlowTask.EnterProgressFrame(1.0f);
-
-			Dependencies.Reset();
-			AssetRegistry.GetDependencies(FAssetIdentifier(PackageName), Dependencies, UE::AssetRegistry::EDependencyCategory::SearchableName);
-			for (const FAssetIdentifier& Dependency : Dependencies)
-			{
-				if (Dependency.PackageName == GameplayTagsScriptPackage && Dependency.ObjectName == GameplayTagStructName && !Dependency.ValueName.IsNone())
-				{
-					ReferencedTagToPackages.FindOrAdd(Dependency.ValueName).Add(PackageName);
-				}
-			}
-		}
-	}
+	// --- Referenced tags from Asset Registry SearchableName dependencies,
+	// via the shared scan service. Metadata only — no asset ever loads.
+	FTagToolboxTagScanService& ScanService = FTagToolboxTagScanService::Get();
+	ScanService.RunScan(bAllowDialog);
+	const TMap<FName, TArray<FName>>& ReferencedTagToPackages = ScanService.GetReferencedTagToPackages();
 
 	TSet<FName> ReferencedTags;
 	ReferencedTagToPackages.GetKeys(ReferencedTags);

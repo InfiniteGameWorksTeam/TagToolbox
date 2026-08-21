@@ -2,10 +2,12 @@
 
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
+#include "GameplayTagsSettings.h"
 #include "Misc/AutomationTest.h"
 #include "TagToolboxAudit.h"
 #include "TagToolboxCommentTint.h"
 #include "TagToolboxSettings.h"
+#include "TagToolboxTagScanService.h"
 #include "TagToolboxVariableFilterCustomization.h"
 #include "UObject/UnrealType.h"
 
@@ -221,6 +223,147 @@ bool FTagToolboxCommentTokenTest::RunTest(const FString& Parameters)
 		}
 	}
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxScanRedirectAggregationTest,
+	"TagToolbox.ScanService.RedirectAggregation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxScanRedirectAggregationTest::RunTest(const FString& Parameters)
+{
+	// Two transient source lists standing in for DefaultGameplayTags.ini and a
+	// Config/Tags list — the aggregation must see BOTH and each record must
+	// resolve its owning list (the v0.1 settings-only read was the blind spot).
+	UGameplayTagsList* SettingsLikeList = NewObject<UGameplayTagsList>(GetTransientPackage());
+	UGameplayTagsList* SecondaryList = NewObject<UGameplayTagsList>(GetTransientPackage());
+
+	{
+		FGameplayTagRedirect& Redirect = SettingsLikeList->GameplayTagRedirects.AddDefaulted_GetRef();
+		Redirect.OldTagName = FName(TEXT("Combat.OldSettings"));
+		Redirect.NewTagName = FName(TEXT("Combat.NewSettings"));
+	}
+	{
+		FGameplayTagRedirect& Redirect = SecondaryList->GameplayTagRedirects.AddDefaulted_GetRef();
+		Redirect.OldTagName = FName(TEXT("Combat.OldSecondary"));
+		Redirect.NewTagName = FName(TEXT("Combat.NewSecondary"));
+	}
+
+	const FName SettingsSourceName(TEXT("DefaultGameplayTags.ini"));
+	const FName SecondarySourceName(TEXT("ProbeTags.ini"));
+
+	TArray<FTagToolboxRedirectRecord> Records;
+	FTagToolboxTagScanService::CollectRedirectsFromList(SettingsSourceName, SettingsLikeList, Records);
+	FTagToolboxTagScanService::CollectRedirectsFromList(SecondarySourceName, SecondaryList, Records);
+
+	TestEqual(TEXT("Both lists contribute records"), Records.Num(), 2);
+	if (Records.Num() == 2)
+	{
+		TestEqual(TEXT("Settings record old name"), Records[0].OldTagName, FName(TEXT("Combat.OldSettings")));
+		TestEqual(TEXT("Settings record owning source"), Records[0].OwningSourceName, SettingsSourceName);
+		TestTrue(TEXT("Settings record resolves owning list"), Records[0].OwningList.Get() == SettingsLikeList);
+
+		TestEqual(TEXT("Secondary record old name"), Records[1].OldTagName, FName(TEXT("Combat.OldSecondary")));
+		TestEqual(TEXT("Secondary record owning source"), Records[1].OwningSourceName, SecondarySourceName);
+		TestTrue(TEXT("Secondary record resolves owning list"), Records[1].OwningList.Get() == SecondaryList);
+	}
+
+	// Settings-only fixture: aggregated old-name set matches the v0.1 read
+	// exactly, so single-source projects classify byte-identically.
+	TArray<FTagToolboxRedirectRecord> SettingsOnlyRecords;
+	FTagToolboxTagScanService::CollectRedirectsFromList(SettingsSourceName, SettingsLikeList, SettingsOnlyRecords);
+	TestEqual(TEXT("Settings-only fixture record count"), SettingsOnlyRecords.Num(), 1);
+	if (SettingsOnlyRecords.Num() == 1)
+	{
+		TestEqual(TEXT("Settings-only old name unchanged"), SettingsOnlyRecords[0].OldTagName, FName(TEXT("Combat.OldSettings")));
+	}
+
+	// Null list contributes nothing rather than crashing.
+	TArray<FTagToolboxRedirectRecord> NullRecords;
+	FTagToolboxTagScanService::CollectRedirectsFromList(SettingsSourceName, nullptr, NullRecords);
+	TestEqual(TEXT("Null list contributes nothing"), NullRecords.Num(), 0);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxScanExpandSubtreeTest,
+	"TagToolbox.ScanService.ExpandSubtreeNames",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxScanExpandSubtreeTest::RunTest(const FString& Parameters)
+{
+	TSet<FName> Snapshot = {
+		FName(TEXT("Combat")),
+		FName(TEXT("Combat.Heavy")),
+		FName(TEXT("Combat.Heavy.Spin")),
+		FName(TEXT("Combat.Light")),
+		FName(TEXT("CombatArena")),   // shares the prefix string but not the subtree
+		FName(TEXT("Movement.Run")),
+	};
+
+	{
+		const TArray<FName> Subtree = FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, FName(TEXT("Combat")));
+		TestEqual(TEXT("Subtree has parent plus descendants"), Subtree.Num(), 4);
+		if (Subtree.Num() == 4)
+		{
+			TestEqual(TEXT("Sorted first"), Subtree[0], FName(TEXT("Combat")));
+			TestEqual(TEXT("Sorted second"), Subtree[1], FName(TEXT("Combat.Heavy")));
+			TestEqual(TEXT("Sorted third"), Subtree[2], FName(TEXT("Combat.Heavy.Spin")));
+			TestEqual(TEXT("Sorted fourth"), Subtree[3], FName(TEXT("Combat.Light")));
+		}
+		TestFalse(TEXT("Prefix-similar sibling excluded"), Subtree.Contains(FName(TEXT("CombatArena"))));
+	}
+
+	{
+		const TArray<FName> Leaf = FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, FName(TEXT("Movement.Run")));
+		TestEqual(TEXT("Leaf expands to itself"), Leaf.Num(), 1);
+	}
+
+	{
+		const TArray<FName> Missing = FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, FName(TEXT("Absent")));
+		TestEqual(TEXT("Absent parent expands to nothing"), Missing.Num(), 0);
+		TestEqual(TEXT("None expands to nothing"), FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, NAME_None).Num(), 0);
+	}
+
+	// The helper operates on the supplied snapshot only: mutating the table
+	// afterwards cannot change an already-computed expansion, and re-running
+	// against the ORIGINAL snapshot still yields the original answer.
+	const TArray<FName> Before = FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, FName(TEXT("Combat")));
+	TSet<FName> MutatedTable = Snapshot;
+	MutatedTable.Add(FName(TEXT("Combat.New")));
+	const TArray<FName> FromSnapshotAgain = FTagToolboxTagScanService::ExpandSubtreeNames(Snapshot, FName(TEXT("Combat")));
+	TestEqual(TEXT("Snapshot expansion unaffected by post-snapshot table changes"), FromSnapshotAgain, Before);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxScanCacheStateTest,
+	"TagToolbox.ScanService.CacheStateTransitions",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxScanCacheStateTest::RunTest(const FString& Parameters)
+{
+	FTagToolboxTagScanService& Service = FTagToolboxTagScanService::Get();
+
+	int32 BroadcastCount = 0;
+	FDelegateHandle Handle = Service.OnScanStateChanged.AddLambda([&BroadcastCount]() { ++BroadcastCount; });
+
+	TMap<FName, TArray<FName>> Fake;
+	Fake.Add(FName(TEXT("Combat.Heavy")), { FName(TEXT("/Game/A")), FName(TEXT("/Game/B")) });
+	Service.SetCacheForTesting(MoveTemp(Fake));
+
+	TestEqual(TEXT("Scan leaves the cache Fresh"), static_cast<int32>(Service.GetState()), static_cast<int32>(ETagToolboxScanState::Fresh));
+	TestEqual(TEXT("Fresh count reads from the cache"), Service.GetExactUsageCount(FName(TEXT("Combat.Heavy"))), 2);
+	TestEqual(TEXT("Scanned-but-absent tag counts zero"), Service.GetExactUsageCount(FName(TEXT("Combat.Absent"))), 0);
+	TestEqual(TEXT("Scan broadcast fired"), BroadcastCount, 1);
+
+	Service.MarkStale();
+	TestEqual(TEXT("Invalidation flips Fresh to Stale"), static_cast<int32>(Service.GetState()), static_cast<int32>(ETagToolboxScanState::Stale));
+	TestEqual(TEXT("Stale keeps the cached count — no auto-rescan, no zeroing"), Service.GetExactUsageCount(FName(TEXT("Combat.Heavy"))), 2);
+	TestEqual(TEXT("Stale broadcast fired"), BroadcastCount, 2);
+
+	Service.MarkStale();
+	TestEqual(TEXT("Repeat invalidation is a no-op"), BroadcastCount, 2);
+	TestEqual(TEXT("State stays Stale"), static_cast<int32>(Service.GetState()), static_cast<int32>(ETagToolboxScanState::Stale));
+
+	Service.OnScanStateChanged.Remove(Handle);
 	return true;
 }
 

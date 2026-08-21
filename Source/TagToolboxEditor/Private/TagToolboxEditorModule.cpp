@@ -19,6 +19,7 @@
 #include "TagToolboxSettings.h"
 #include "TagToolboxTagContainerPillCustomization.h"
 #include "TagToolboxTagPillCustomization.h"
+#include "TagToolboxTagScanService.h"
 #include "TagToolboxVariableFilterCustomization.h"
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
@@ -107,6 +108,7 @@ void FTagToolboxEditorModule::ShutdownModule()
 	UnregisterTagPillCustomization();
 	UnregisterCommentTintFactory();
 	UnregisterTabs();
+	FTagToolboxTagScanService::Shutdown();
 }
 
 void FTagToolboxEditorModule::HandlePostEngineInit()

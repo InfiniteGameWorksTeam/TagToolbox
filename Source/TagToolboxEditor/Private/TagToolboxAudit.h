@@ -58,8 +58,14 @@ struct FTagToolboxAudit
 	 */
 	static bool AreNamesNearDuplicate(const FString& A, const FString& B);
 
-	/** Runs the complete audit against the editor Asset Registry. Never loads assets. */
-	static TArray<TSharedPtr<FTagToolboxAuditRow>> RunAudit();
+	/**
+	 * Runs the complete audit against the editor Asset Registry. Never loads
+	 * assets. The referencer walk runs through the shared scan service (so an
+	 * explicit audit run also refreshes Browser usage counts), and redirects
+	 * aggregate across EVERY tag source list, not just the default settings
+	 * list. bAllowDialog=false suppresses the slow-task dialog (commandlet).
+	 */
+	static TArray<TSharedPtr<FTagToolboxAuditRow>> RunAudit(bool bAllowDialog = true);
 
 	static FText GetCategoryDisplayText(ETagToolboxAuditCategory Category);
 	static FLinearColor GetCategoryColor(ETagToolboxAuditCategory Category);
