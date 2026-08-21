@@ -100,6 +100,13 @@ struct FTagToolboxAudit
 	static FText GetRedirectTargetVerdictText(ETagToolboxRedirectTargetVerdict Verdict);
 
 	/**
+	 * The complete defined-tag-name set, implicit parents included — the one
+	 * shared "what exists right now" snapshot builder (audit classification,
+	 * rename planning, redirect-target validation all consume it).
+	 */
+	static TSet<FName> CollectAllDefinedTagNames();
+
+	/**
 	 * Runs the complete audit against the editor Asset Registry. Never loads
 	 * assets. The referencer walk runs through the shared scan service (so an
 	 * explicit audit run also refreshes Browser usage counts), and redirects

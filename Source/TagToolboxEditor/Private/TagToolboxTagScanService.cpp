@@ -29,6 +29,11 @@ FTagToolboxTagScanService& FTagToolboxTagScanService::Get()
 	return *TagToolboxScanInternal::GInstance;
 }
 
+FTagToolboxTagScanService* FTagToolboxTagScanService::TryGet()
+{
+	return TagToolboxScanInternal::GInstance.Get();
+}
+
 void FTagToolboxTagScanService::Shutdown()
 {
 	TagToolboxScanInternal::GInstance.Reset();

@@ -53,6 +53,12 @@ class FTagToolboxTagScanService
 public:
 	/** Module-owned singleton. Created lazily; released by Shutdown(). */
 	static FTagToolboxTagScanService& Get();
+	/**
+	 * Non-creating accessor for teardown paths (widget destructors, delegate
+	 * removal): returns null after Shutdown() instead of resurrecting the
+	 * singleton and re-registering its delegates past module shutdown.
+	 */
+	static FTagToolboxTagScanService* TryGet();
 	/** Unbinds delegates and destroys the instance (module shutdown). */
 	static void Shutdown();
 

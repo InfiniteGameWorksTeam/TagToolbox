@@ -79,7 +79,7 @@ if ($IncludePluginContent)     { $CommandletArgs += '-IncludePluginContent' }
 Write-Host "[tagtoolbox-audit] Running: $EditorCmd $($CommandletArgs -join ' ')"
 $Process = Start-Process -FilePath $EditorCmd -ArgumentList $CommandletArgs -NoNewWindow -PassThru
 if (-not $Process.WaitForExit($TimeoutMinutes * 60 * 1000)) {
-    try { $Process.Kill($true) } catch {}
+    try { $Process.Kill($true); $Process.WaitForExit(30000) | Out-Null } catch {}
     Fail-Infra "Commandlet did not finish within $TimeoutMinutes minutes."
 }
 # The timed WaitForExit overload does not populate ExitCode; the void overload

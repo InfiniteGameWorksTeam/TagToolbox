@@ -600,6 +600,17 @@ bool FTagToolboxResavePlanTest::RunTest(const FString& Parameters)
 		const FTagToolboxResaveReport Report = FTagToolboxResaveService::BuildReport(Plan, AllSaved, TSet<FName>());
 		TestTrue(TEXT("All-saved outcome reports clean"), Report.AllIncludedSaved());
 	}
+
+	// --- Precedence pin: a package present in BOTH sets (saved on a retry
+	// after an earlier failure) classifies Saved — the save event is ground
+	// truth, the failed list is history.
+	{
+		const TSet<FName> Saved = { FName(TEXT("/Game/NotLoaded")) };
+		const TSet<FName> Failed = { FName(TEXT("/Game/NotLoaded")) };
+		const FTagToolboxResaveReport Report = FTagToolboxResaveService::BuildReport(Plan, Saved, Failed);
+		TestTrue(TEXT("Saved-and-failed package classifies Saved"), Report.Saved.Contains(FName(TEXT("/Game/NotLoaded"))));
+		TestFalse(TEXT("Saved-and-failed package not doubled into Failed"), Report.Failed.Contains(FName(TEXT("/Game/NotLoaded"))));
+	}
 	{
 		const FTagToolboxResavePlan EmptyPlan = FTagToolboxResaveService::BuildPlan(TArray<FTagToolboxPackageFacts>());
 		TestEqual(TEXT("No facts produce an empty plan"), EmptyPlan.Entries.Num(), 0);
@@ -616,6 +627,7 @@ namespace
 		FName OldName;
 		FName NewName;
 		bool bNewNameValid = true;
+		bool bTagSourcesWritable = true;
 		TSet<FName> Snapshot;
 		TArray<FTagToolboxRedirectRecord> Redirects;
 		TMap<FName, FName> NameToSource;
@@ -629,8 +641,8 @@ namespace
 
 	FTagToolboxRenamePlan TagToolboxTest_BuildRenamePlan(const FTagToolboxTest_RenamePlanArgs& Args)
 	{
-		return FTagToolboxRenameFixup::BuildPlan(Args.OldName, Args.NewName, Args.bNewNameValid, Args.Snapshot,
-			Args.Redirects, Args.NameToSource, Args.UnwritableSources, Args.Styles, Args.Favorites, Args.Recents,
+		return FTagToolboxRenameFixup::BuildPlan(Args.OldName, Args.NewName, Args.bNewNameValid, Args.bTagSourcesWritable,
+			Args.Snapshot, Args.Redirects, Args.NameToSource, Args.UnwritableSources, Args.Styles, Args.Favorites, Args.Recents,
 			Args.MergeRefs, Args.MergeChildren);
 	}
 
@@ -747,6 +759,56 @@ bool FTagToolboxRenamePlanBuildTest::RunTest(const FString& Parameters)
 		Args.bNewNameValid = false;
 		TestEqual(TEXT("Invalid new name refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
 	}
+
+	// Unwritable tag sources (ShouldImportTagsFromINI false) refuse up front.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.bTagSourcesWritable = false;
+		TestEqual(TEXT("Ini-import-off project refuses rename"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
+	}
+
+	// Rename-back refusal: the target being an existing redirect OLD name
+	// would destroy the identity (engine resolves through the redirect and
+	// never re-creates it; collapsing writes a self-redirect).
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Strong"), TEXT("Combat.Heavy")));
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Rename onto a redirect old-name refused"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
+		TestFalse(TEXT("Rename-back refusal names the redirect"), Plan.VerdictReason.IsEmpty());
+	}
+
+	// Self-collapse exclusion: a chain whose old name IS the renamed form of
+	// its target never enters the retirement re-query (it is the LIVE tag).
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Strong.Spin"), TEXT("Combat.Heavy.Spin")));
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Self-collapse chain still collected for removal"), Plan.ChainsToCollapse.Num(), 1);
+		TestFalse(TEXT("Live tag name excluded from retirement re-query"), Plan.RetirementVerificationNames.Contains(FName(TEXT("Combat.Strong.Spin"))));
+	}
+
+	// Recovery reconstructs the WHOLE subtree from the redirect records the
+	// original rename wrote — children resume too, not just the parent.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Snapshot.Remove(FName(TEXT("Combat.Heavy")));
+		Args.Snapshot.Remove(FName(TEXT("Combat.Heavy.Spin")));
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Heavy"), TEXT("Combat.Strong")));
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Heavy.Spin"), TEXT("Combat.Strong.Spin")));
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Heavy.Other"), TEXT("Somewhere.Unrelated"))); // NOT part of this rename
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Recovery is skip-to-resave"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::SkipToResave));
+		TestEqual(TEXT("Recovery subtree includes the child"), Plan.SubtreeOldNames.Num(), 2);
+		TestTrue(TEXT("Child old name resumes"), Plan.SubtreeOldNames.Contains(FName(TEXT("Combat.Heavy.Spin"))));
+		TestTrue(TEXT("Child verification resumes"), Plan.RetirementVerificationNames.Contains(FName(TEXT("Combat.Heavy.Spin"))));
+		TestFalse(TEXT("Unrelated redirect under the old root not adopted"), Plan.SubtreeOldNames.Contains(FName(TEXT("Combat.Heavy.Other"))));
+	}
+
+	// DeriveRenamedName is case-insensitive on the prefix.
+	TestEqual(TEXT("Casing-divergent subtree member still re-roots"),
+		FTagToolboxRenameFixup::DeriveRenamedName(FName(TEXT("combat.heavy.spin")), FName(TEXT("Combat.Heavy")), FName(TEXT("Combat.Strong"))),
+		FName(TEXT("Combat.Strong.spin")));
 
 	return true;
 }
@@ -919,6 +981,31 @@ bool FTagToolboxAuditReportTest::RunTest(const FString& Parameters)
 		PassingRows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::UnusedDefined, TEXT("Combat.Idle")));
 		const FString PassingJson = FTagToolboxAuditReportBuilder::GenerateJson(PassingRows, DefaultOptions, StartedUtc, FinishedUtc);
 		TestTrue(TEXT("Unused-only report passes by default"), PassingJson.Contains(TEXT("\"failed\": false")));
+	}
+	{
+		// The common clean-CI shape: no findings at all.
+		const FString EmptyJson = FTagToolboxAuditReportBuilder::GenerateJson(TArray<TSharedPtr<FTagToolboxAuditRow>>(), DefaultOptions, StartedUtc, FinishedUtc);
+		TestTrue(TEXT("Empty report carries schema"), EmptyJson.Contains(TEXT("\"schema_version\": 1")));
+		TestTrue(TEXT("Empty report passes"), EmptyJson.Contains(TEXT("\"failed\": false")));
+		TestTrue(TEXT("Empty report has an empty findings array"), EmptyJson.Contains(TEXT("\"findings\": []")));
+	}
+	{
+		// Definition-side rows pass through scope untouched even when they
+		// carry referencer lists (broken redirect with plugin referencers).
+		TArray<TSharedPtr<FTagToolboxAuditRow>> BrokenRows;
+		BrokenRows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::BrokenRedirect, TEXT("Combat.Dead"), { TEXT("/SomePlugin/P") }));
+		const TArray<TSharedPtr<FTagToolboxAuditRow>> ScopedBroken = FTagToolboxAuditReportBuilder::ApplyScope(BrokenRows, DefaultOptions);
+		TestEqual(TEXT("BrokenRedirect row passes scope regardless of referencers"), ScopedBroken.Num(), 1);
+		if (ScopedBroken.Num() == 1)
+		{
+			TestEqual(TEXT("Definition-side referencer list untouched by scope"), ScopedBroken[0]->ReferencerPackages.Num(), 1);
+		}
+	}
+	{
+		// PackageInScope edges: script packages and bare roots.
+		TestFalse(TEXT("Script package out of default scope"), FTagToolboxAuditReportBuilder::PackageInScope(FName(TEXT("/Script/Engine")), DefaultOptions));
+		TestFalse(TEXT("Bare /Game root (no trailing content) out of scope"), FTagToolboxAuditReportBuilder::PackageInScope(FName(TEXT("/Game")), DefaultOptions));
+		TestTrue(TEXT("Game content in scope"), FTagToolboxAuditReportBuilder::PackageInScope(FName(TEXT("/Game/Maps/Map")), DefaultOptions));
 	}
 
 	return true;

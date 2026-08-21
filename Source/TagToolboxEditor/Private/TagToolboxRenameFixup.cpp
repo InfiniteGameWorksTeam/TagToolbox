@@ -16,6 +16,7 @@
 #include "Misc/MessageDialog.h"
 #include "STagToolboxResaveDialog.h"
 #include "SourceControlHelpers.h"
+#include "TagToolboxNotifications.h"
 #include "TagToolboxSettings.h"
 #include "Widgets/Notifications/SNotificationList.h"
 
@@ -25,9 +26,7 @@ namespace TagToolboxRenameInternal
 {
 	static void Notify(const FText& Message)
 	{
-		FNotificationInfo Info(Message);
-		Info.ExpireDuration = 5.0f;
-		FSlateNotificationManager::Get().AddNotification(Info);
+		TagToolboxNotifications::Show(Message);
 	}
 
 	/** The config path a list persists to (settings uses its default file). */
@@ -125,6 +124,7 @@ FTagToolboxRenamePlan FTagToolboxRenameFixup::BuildPlan(
 	FName OldName,
 	FName NewName,
 	bool bNewNameValidTagString,
+	bool bTagSourcesWritable,
 	const TSet<FName>& TagTableSnapshot,
 	const TArray<FTagToolboxRedirectRecord>& AllRedirects,
 	const TMap<FName, FName>& SubtreeNameToSource,
@@ -146,6 +146,12 @@ FTagToolboxRenamePlan FTagToolboxRenameFixup::BuildPlan(
 	{
 		Plan.Verdict = ETagToolboxRenameVerdict::RefusedInvalid;
 		Plan.VerdictReason = LOCTEXT("InvalidNames", "The new tag name is not a valid tag string.");
+		return Plan;
+	}
+	if (!bTagSourcesWritable)
+	{
+		Plan.Verdict = ETagToolboxRenameVerdict::RefusedInvalid;
+		Plan.VerdictReason = LOCTEXT("IniImportOff", "This project does not import tags from ini files (ShouldImportTagsFromINI is false) — the engine rename cannot write anything.");
 		return Plan;
 	}
 	if (OldString.Equals(NewString, ESearchCase::IgnoreCase))
@@ -172,6 +178,25 @@ FTagToolboxRenamePlan FTagToolboxRenameFixup::BuildPlan(
 		return Plan;
 	}
 
+	// Renaming ONTO a name that currently redirects elsewhere destroys the
+	// identity: the engine resolves the target THROUGH the surviving redirect
+	// (so it never re-creates it), and collapsing the reverse chain would
+	// write a self-redirect. Same rule Create Redirect enforces for targets.
+	for (const FTagToolboxRedirectRecord& Redirect : AllRedirects)
+	{
+		if (Redirect.NewTagName == NewName && Redirect.OldTagName == OldName)
+		{
+			continue; // The recovery pair itself — handled below.
+		}
+		if (Redirect.OldTagName == NewName)
+		{
+			Plan.Verdict = ETagToolboxRenameVerdict::RefusedInvalid;
+			Plan.VerdictReason = FText::Format(LOCTEXT("TargetIsRedirectOldName", "'{0}' is currently a redirected OLD tag name (it points at '{1}'). Retire or collapse that redirect first — renaming onto it would leave an unresolvable identity."),
+				FText::AsCultureInvariant(NewString), FText::FromName(Redirect.NewTagName));
+			return Plan;
+		}
+	}
+
 	if (!TagTableSnapshot.Contains(OldName))
 	{
 		// Recovery entry: a prior partial run left the redirect in place. The
@@ -183,16 +208,39 @@ FTagToolboxRenamePlan FTagToolboxRenameFixup::BuildPlan(
 			{
 				Plan.Verdict = ETagToolboxRenameVerdict::SkipToResave;
 				Plan.VerdictReason = LOCTEXT("SkipToResave", "This name already redirects to the requested target (a previous rename did not finish its fix-up). Applying resumes at the referencer resave.");
+
+				// Reconstruct the WHOLE subtree the original rename touched
+				// from the redirect records it wrote — resuming only the
+				// parent would leave child referencers unfixed and child
+				// redirects unretired despite the "re-running resumes the
+				// fix-up" promise.
 				Plan.SubtreeOldNames.Add(OldName);
 				Plan.OldToNewNames.Add(OldName, NewName);
 				Plan.RetirementVerificationNames.Add(OldName);
-				// Chain-reachable old names still verify before retirement.
+				const FString ChildPrefix = OldString + TEXT(".");
+				for (const FTagToolboxRedirectRecord& ChildRedirect : AllRedirects)
+				{
+					if (ChildRedirect.OldTagName.ToString().StartsWith(ChildPrefix, ESearchCase::IgnoreCase)
+						&& ChildRedirect.NewTagName == DeriveRenamedName(ChildRedirect.OldTagName, OldName, NewName))
+					{
+						Plan.SubtreeOldNames.AddUnique(ChildRedirect.OldTagName);
+						Plan.OldToNewNames.Add(ChildRedirect.OldTagName, ChildRedirect.NewTagName);
+						Plan.RetirementVerificationNames.AddUnique(ChildRedirect.OldTagName);
+					}
+				}
+				Plan.SubtreeOldNames.Sort(FNameLexicalLess());
+
+				// Chain-reachable old names still verify before retirement,
+				// and the resumed apply collapses them (same as a fresh run).
 				for (const FTagToolboxRedirectRecord& Chain : AllRedirects)
 				{
-					if (Chain.NewTagName == OldName)
+					if (Plan.OldToNewNames.Contains(Chain.NewTagName))
 					{
 						Plan.ChainsToCollapse.Add(Chain);
-						Plan.RetirementVerificationNames.AddUnique(Chain.OldTagName);
+						if (Chain.OldTagName != Plan.OldToNewNames.FindRef(Chain.NewTagName))
+						{
+							Plan.RetirementVerificationNames.AddUnique(Chain.OldTagName);
+						}
 					}
 				}
 				return Plan;
@@ -238,12 +286,18 @@ FTagToolboxRenamePlan FTagToolboxRenameFixup::BuildPlan(
 
 	// Chains touching the subtree collapse to point at the renamed names —
 	// never left chained (single-hop redirect resolution cannot follow A→B→C).
+	// A chain whose old name IS the renamed form of its target would collapse
+	// into a self-redirect: it is removed without replacement at apply time
+	// and its (live) name never enters the retirement re-query.
 	for (const FTagToolboxRedirectRecord& Redirect : AllRedirects)
 	{
 		if (Plan.OldToNewNames.Contains(Redirect.NewTagName))
 		{
 			Plan.ChainsToCollapse.Add(Redirect);
-			Plan.RetirementVerificationNames.AddUnique(Redirect.OldTagName);
+			if (Redirect.OldTagName != Plan.OldToNewNames.FindRef(Redirect.NewTagName))
+			{
+				Plan.RetirementVerificationNames.AddUnique(Redirect.OldTagName);
+			}
 		}
 	}
 
@@ -309,8 +363,8 @@ TMap<FName, TArray<FName>> FTagToolboxRenameFixup::QueryLiveReferencers(const TA
 
 bool FTagToolboxRenameFixup::RemoveRedirectRowsChecked(const TArray<FTagToolboxRedirectRecord>& Rows, FText& OutError)
 {
-	// Group by owning list so each ini writes (and can revert) once.
-	TMap<UGameplayTagsList*, TArray<FGameplayTagRedirect>> RemovedPerList;
+	// Group by owning list first — nothing mutates if any list is gone.
+	TMap<UGameplayTagsList*, TArray<FTagToolboxRedirectRecord>> RowsPerList;
 	for (const FTagToolboxRedirectRecord& Row : Rows)
 	{
 		UGameplayTagsList* List = Row.OwningList.Get();
@@ -319,34 +373,48 @@ bool FTagToolboxRenameFixup::RemoveRedirectRowsChecked(const TArray<FTagToolboxR
 			OutError = FText::Format(LOCTEXT("ListGone", "The tag source list owning redirect '{0}' no longer exists."), FText::FromName(Row.OldTagName));
 			return false;
 		}
-		for (int32 Index = List->GameplayTagRedirects.Num() - 1; Index >= 0; --Index)
-		{
-			const FGameplayTagRedirect& Redirect = List->GameplayTagRedirects[Index];
-			if (Redirect.OldTagName == Row.OldTagName && Redirect.NewTagName == Row.NewTagName)
-			{
-				RemovedPerList.FindOrAdd(List).Add(Redirect);
-				List->GameplayTagRedirects.RemoveAt(Index);
-			}
-		}
+		RowsPerList.FindOrAdd(List).Add(Row);
 	}
 
-	for (const TPair<UGameplayTagsList*, TArray<FGameplayTagRedirect>>& Pair : RemovedPerList)
+	// Per-list transactionality: remove → persist one list at a time. On a
+	// persist failure only THIS list's rows revert; already-persisted lists
+	// stay retired (their disk and memory agree — re-adding their rows in
+	// memory would be the divergence). The error names what remains.
+	int32 ListsPersisted = 0;
+	for (const TPair<UGameplayTagsList*, TArray<FTagToolboxRedirectRecord>>& Pair : RowsPerList)
 	{
-		FText PersistError;
-		if (!TagToolboxRenameInternal::PersistListChecked(Pair.Key, PersistError))
+		UGameplayTagsList* List = Pair.Key;
+		TArray<FGameplayTagRedirect> Removed;
+		for (const FTagToolboxRedirectRecord& Row : Pair.Value)
 		{
-			// Revert every in-memory mutation: a half-persisted retirement
-			// resurrects rows next session while this session believes them gone.
-			for (const TPair<UGameplayTagsList*, TArray<FGameplayTagRedirect>>& RevertPair : RemovedPerList)
+			for (int32 Index = List->GameplayTagRedirects.Num() - 1; Index >= 0; --Index)
 			{
-				for (const FGameplayTagRedirect& Removed : RevertPair.Value)
+				const FGameplayTagRedirect& Redirect = List->GameplayTagRedirects[Index];
+				if (Redirect.OldTagName == Row.OldTagName && Redirect.NewTagName == Row.NewTagName)
 				{
-					RevertPair.Key->GameplayTagRedirects.AddUnique(Removed);
+					Removed.Add(Redirect);
+					List->GameplayTagRedirects.RemoveAt(Index);
 				}
 			}
-			OutError = PersistError;
+		}
+		if (Removed.Num() == 0)
+		{
+			continue; // Rows already gone (idempotent re-run).
+		}
+
+		FText PersistError;
+		if (!TagToolboxRenameInternal::PersistListChecked(List, PersistError))
+		{
+			for (const FGameplayTagRedirect& RemovedRow : Removed)
+			{
+				List->GameplayTagRedirects.AddUnique(RemovedRow);
+			}
+			OutError = FText::Format(LOCTEXT("PartialRetirement", "{0} of {1} list(s) persisted before '{2}' failed: {3} That list's rows were kept — re-run retirement from the audit for the remainder."),
+				FText::AsNumber(ListsPersisted), FText::AsNumber(RowsPerList.Num()),
+				FText::AsCultureInvariant(TagToolboxRenameInternal::ResolveListConfigPath(List)), PersistError);
 			return false;
 		}
+		++ListsPersisted;
 	}
 	return true;
 }
@@ -356,6 +424,14 @@ bool FTagToolboxRenameFixup::AddRedirectRowChecked(FName OldName, FName NewName,
 	if (!OwningList)
 	{
 		OutError = LOCTEXT("NoList", "No owning tag source list.");
+		return false;
+	}
+	if (OldName == NewName)
+	{
+		// A self-redirect makes the name resolve to itself through the
+		// redirector and can never be verified/retired — refuse at the writer
+		// so no caller can produce one.
+		OutError = FText::Format(LOCTEXT("SelfRedirectRefused", "Refusing to write a self-redirect for '{0}'."), FText::FromName(OldName));
 		return false;
 	}
 	FGameplayTagRedirect Redirect;
@@ -444,8 +520,12 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 
 	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
 
-	// Preview referencers, live (feeds the stale-delta check after resave).
-	const TMap<FName, TArray<FName>> PreviewReferencers = QueryLiveReferencers(Plan.SubtreeOldNames);
+	// Preview referencers, live, over the FULL verification set (subtree plus
+	// chain-reachable old names): retirement re-queries exactly this set, so
+	// any name in it must also be in the resave scope — otherwise a
+	// pre-existing chain's referencers block retirement forever while being
+	// mislabeled "appeared since the preview".
+	const TMap<FName, TArray<FName>> PreviewReferencers = QueryLiveReferencers(Plan.RetirementVerificationNames);
 	TSet<FName> PreviewPackages;
 	for (const TPair<FName, TArray<FName>>& Pair : PreviewReferencers)
 	{
@@ -456,6 +536,7 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 	{
 		// --- Snapshot every ini the rename can touch (rollback window).
 		TMap<FString, TArray<uint8>> IniSnapshots;
+		TSet<FString> PreExistingPaths;
 		TSet<FString> TouchedPaths;
 		for (const FName& SubtreeName : Plan.SubtreeOldNames)
 		{
@@ -479,8 +560,16 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 		TouchedPaths.Remove(FString());
 		for (const FString& Path : TouchedPaths)
 		{
-			TArray<uint8>& Bytes = IniSnapshots.Add(Path);
-			FFileHelper::LoadFileToArray(Bytes, *Path); // Missing file = empty snapshot.
+			if (IFileManager::Get().FileExists(*Path))
+			{
+				PreExistingPaths.Add(Path);
+				TArray<uint8>& Bytes = IniSnapshots.Add(Path);
+				FFileHelper::LoadFileToArray(Bytes, *Path);
+			}
+			else
+			{
+				IniSnapshots.Add(Path); // Empty snapshot marks "did not exist".
+			}
 		}
 
 		// --- Rename. Children included; the engine writes one redirect per
@@ -489,11 +578,18 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 		if (!bRenamed)
 		{
 			// --- Rollback: reachable only here, before any package saves.
+			// Files that pre-existed restore their bytes; a file the engine
+			// CREATED during the failed rename is deleted outright — leaving
+			// its partial content behind would survive the rollback.
 			for (const TPair<FString, TArray<uint8>>& Snapshot : IniSnapshots)
 			{
-				if (Snapshot.Value.Num() > 0)
+				if (PreExistingPaths.Contains(Snapshot.Key))
 				{
 					FFileHelper::SaveArrayToFile(Snapshot.Value, *Snapshot.Key);
+				}
+				else if (IFileManager::Get().FileExists(*Snapshot.Key))
+				{
+					IFileManager::Get().Delete(*Snapshot.Key, /*RequireExists=*/false, /*EvenReadOnly=*/true);
 				}
 			}
 			const FString SettingsPath = GetMutableDefault<UGameplayTagsSettings>()->GetDefaultConfigFilename();
@@ -501,10 +597,20 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 			GetMutableDefault<UGameplayTagsSettings>()->ReloadConfig();
 			Manager.EditorRefreshGameplayTagTree();
 
-			// The U2 probe IS the reconciliation check: loose lists reload from
-			// disk on refresh; settings-owned state may not (finding 6).
-			const FGameplayTag Probe = FGameplayTag::RequestGameplayTag(Plan.OldName, /*ErrorIfNotFound=*/false);
-			const bool bReconciled = Probe.IsValid() && Probe.GetTagName() == Plan.OldName;
+			// The U2 probe IS the reconciliation check, run over EVERY subtree
+			// old name: a partial child rename diverges at the child even when
+			// the parent probes clean. Loose lists reload from disk on
+			// refresh; settings-owned state may not (finding 6).
+			bool bReconciled = true;
+			for (const FName& SubtreeName : Plan.SubtreeOldNames)
+			{
+				const FGameplayTag Probe = FGameplayTag::RequestGameplayTag(SubtreeName, /*ErrorIfNotFound=*/false);
+				if (!Probe.IsValid() || Probe.GetTagName() != SubtreeName)
+				{
+					bReconciled = false;
+					break;
+				}
+			}
 			if (bReconciled)
 			{
 				Result.Outcome = ETagToolboxRenameOutcome::RolledBack;
@@ -519,26 +625,43 @@ FTagToolboxRenameResult FTagToolboxRenameFixup::ExecuteRename(const FTagToolboxR
 			return Result;
 		}
 
-		// --- Chain collapse: A→Old becomes A→New in A's own list.
-		for (const FTagToolboxRedirectRecord& Chain : Plan.ChainsToCollapse)
+	}
+
+	// --- Chain collapse: A→Old becomes A→New in A's own list. Runs on BOTH
+	// entry paths — a resumed (skip-to-resave) rename must still collapse the
+	// chains its plan collected, or crash-orphaned A→Old→New chains stay
+	// unresolvable. Idempotent: removal no-ops on absent rows.
+	for (const FTagToolboxRedirectRecord& Chain : Plan.ChainsToCollapse)
+	{
+		const FName* CollapsedTarget = Plan.OldToNewNames.Find(Chain.NewTagName);
+		if (!CollapsedTarget)
 		{
-			const FName* CollapsedTarget = Plan.OldToNewNames.Find(Chain.NewTagName);
-			if (!CollapsedTarget)
+			continue;
+		}
+		FText ChainError;
+		if (Chain.OldTagName == *CollapsedTarget)
+		{
+			// Collapsing would write a self-redirect (rename-back shape):
+			// remove the row without a replacement — the name it carried is
+			// the LIVE tag again and was excluded from retirement re-query.
+			if (!RemoveRedirectRowsChecked({ Chain }, ChainError))
 			{
-				continue;
-			}
-			FText ChainError;
-			if (!RemoveRedirectRowsChecked({ Chain }, ChainError)
-				|| !AddRedirectRowChecked(Chain.OldTagName, *CollapsedTarget, Chain.OwningList.Get(), ChainError))
-			{
-				Notify(FText::Format(LOCTEXT("ChainCollapseFailed", "Could not collapse redirect chain '{0}': {1} The chained redirect will not resolve until fixed."),
+				Notify(FText::Format(LOCTEXT("SelfChainRemoveFailed", "Could not remove the now-redundant redirect '{0}': {1}"),
 					FText::FromName(Chain.OldTagName), ChainError));
 			}
+			continue;
 		}
-
-		// --- Plugin stores move in the same apply.
-		FixupPluginStores(Plan);
+		if (!RemoveRedirectRowsChecked({ Chain }, ChainError)
+			|| !AddRedirectRowChecked(Chain.OldTagName, *CollapsedTarget, Chain.OwningList.Get(), ChainError))
+		{
+			Notify(FText::Format(LOCTEXT("ChainCollapseFailed", "Could not collapse redirect chain '{0}': {1} The chained redirect will not resolve until fixed."),
+				FText::FromName(Chain.OldTagName), ChainError));
+		}
 	}
+
+	// --- Plugin stores move in the same apply (no-op when the plan carries
+	// none, as on the recovery path).
+	FixupPluginStores(Plan);
 
 	// --- Resave every referencer of the whole subtree, under consent.
 	TArray<FName> AllReferencerNames = PreviewPackages.Array();

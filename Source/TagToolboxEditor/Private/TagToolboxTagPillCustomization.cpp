@@ -20,6 +20,7 @@
 #include "STagToolboxTagPicker.h"
 #include "Styling/AppStyle.h"
 #include "TagToolboxColorBridge.h"
+#include "TagToolboxNotifications.h"
 #include "TagToolboxSettings.h"
 #include "TagToolboxTagClipboard.h"
 #include "Widgets/Input/SComboButton.h"
@@ -35,9 +36,7 @@ namespace TagToolboxPillInternal
 	// actual cause so the user knows what to fix.
 	static void ShowRefusal(const FText& Message)
 	{
-		FNotificationInfo Info(Message);
-		Info.ExpireDuration = 4.0f;
-		FSlateNotificationManager::Get().AddNotification(Info);
+		TagToolboxNotifications::Show(Message, 4.0f);
 	}
 }
 

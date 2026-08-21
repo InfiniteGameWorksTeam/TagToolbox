@@ -165,6 +165,18 @@ FText FTagToolboxAudit::GetRedirectTargetVerdictText(ETagToolboxRedirectTargetVe
 	}
 }
 
+TSet<FName> FTagToolboxAudit::CollectAllDefinedTagNames()
+{
+	TSet<FName> DefinedTags;
+	FGameplayTagContainer AllTags;
+	UGameplayTagsManager::Get().RequestAllGameplayTags(AllTags, /*OnlyIncludeDictionaryTags=*/false);
+	for (const FGameplayTag& DefinedTag : AllTags)
+	{
+		DefinedTags.Add(DefinedTag.GetTagName());
+	}
+	return DefinedTags;
+}
+
 TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDialog)
 {
 	using namespace TagToolboxAuditInternal;
@@ -175,15 +187,7 @@ TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDi
 
 	// --- Defined tags (full set, implicit parents included: a referenced
 	// parent that exists only implicitly is not "undefined").
-	TSet<FName> DefinedTags;
-	{
-		FGameplayTagContainer AllTags;
-		Manager.RequestAllGameplayTags(AllTags, /*OnlyIncludeDictionaryTags=*/false);
-		for (const FGameplayTag& Tag : AllTags)
-		{
-			DefinedTags.Add(Tag.GetTagName());
-		}
-	}
+	const TSet<FName> DefinedTags = CollectAllDefinedTagNames();
 
 	// --- Redirects aggregated across EVERY tag source list. The engine writes
 	// rename redirects to the OLD tag's source list, so a settings-only read

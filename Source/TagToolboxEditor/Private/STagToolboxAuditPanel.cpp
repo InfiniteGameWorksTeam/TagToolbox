@@ -9,11 +9,13 @@
 #include "GameplayTagsManager.h"
 #include "GameplayTagsSettings.h"
 #include "HAL/PlatformApplicationMisc.h"
+#include "Misc/App.h"
 #include "Misc/MessageDialog.h"
 #include "STagToolboxRenameDialog.h"
 #include "STagToolboxResaveDialog.h"
 #include "STagToolboxTagPicker.h"
 #include "Styling/AppStyle.h"
+#include "TagToolboxNotifications.h"
 #include "TagToolboxRenameFixup.h"
 #include "TagToolboxResaveService.h"
 #include "TagToolboxTagScanService.h"
@@ -37,9 +39,7 @@ namespace TagToolboxAuditPanel
 
 	static void Notify(const FText& Message)
 	{
-		FNotificationInfo Info(Message);
-		Info.ExpireDuration = 6.0f;
-		FSlateNotificationManager::Get().AddNotification(Info);
+		TagToolboxNotifications::Show(Message, 6.0f);
 	}
 
 	static FString JoinFirstNames(const TArray<FName>& Names, int32 MaxShown)
@@ -60,7 +60,8 @@ namespace TagToolboxAuditPanel
 	/** Modal target picker for Create Redirect… — empty pick = cancel. */
 	static FName PickRedirectTargetModal(FName OldName)
 	{
-		if (!FSlateApplication::IsInitialized())
+		// Headless-safe like the sibling dialogs: refuse (cancel), never open.
+		if (!FApp::CanEverRender() || !FSlateApplication::IsInitialized())
 		{
 			return NAME_None;
 		}
@@ -157,6 +158,9 @@ private:
 void STagToolboxAuditPanel::Construct(const FArguments& InArgs)
 {
 	TagTreeChangedHandle = UGameplayTagsManager::OnEditorRefreshGameplayTagTree.AddSP(this, &STagToolboxAuditPanel::HandleTagTreeChanged);
+	// Package saves also stale the results (the scan service already tracks
+	// exactly that) — a tag-tree-only banner would let rows rot after saves.
+	ScanStateChangedHandle = FTagToolboxTagScanService::Get().OnScanStateChanged.AddSP(this, &STagToolboxAuditPanel::HandleScanStateChanged);
 
 	ChildSlot
 	[
@@ -315,11 +319,23 @@ void STagToolboxAuditPanel::Construct(const FArguments& InArgs)
 STagToolboxAuditPanel::~STagToolboxAuditPanel()
 {
 	UGameplayTagsManager::OnEditorRefreshGameplayTagTree.Remove(TagTreeChangedHandle);
+	if (FTagToolboxTagScanService* ScanService = FTagToolboxTagScanService::TryGet())
+	{
+		ScanService->OnScanStateChanged.Remove(ScanStateChangedHandle);
+	}
 }
 
 void STagToolboxAuditPanel::HandleTagTreeChanged()
 {
 	if (bHasRun)
+	{
+		bResultsStale = true;
+	}
+}
+
+void STagToolboxAuditPanel::HandleScanStateChanged()
+{
+	if (bHasRun && FTagToolboxTagScanService::Get().GetState() == ETagToolboxScanState::Stale)
 	{
 		bResultsStale = true;
 	}
@@ -567,15 +583,7 @@ FReply STagToolboxAuditPanel::HandleCreateRedirectClicked()
 	}
 
 	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
-	TSet<FName> DefinedTags;
-	{
-		FGameplayTagContainer AllTags;
-		Manager.RequestAllGameplayTags(AllTags, /*OnlyIncludeDictionaryTags=*/false);
-		for (const FGameplayTag& DefinedTag : AllTags)
-		{
-			DefinedTags.Add(DefinedTag.GetTagName());
-		}
-	}
+	const TSet<FName> DefinedTags = FTagToolboxAudit::CollectAllDefinedTagNames();
 	TSet<FName> AggregatedOldNames;
 	for (const FTagToolboxRedirectRecord& Record : FTagToolboxTagScanService::CollectAllRedirects())
 	{

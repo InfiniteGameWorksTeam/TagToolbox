@@ -93,9 +93,14 @@ public:
 	SLATE_END_ARGS()
 
 	/**
-	 * Pure usage-sort comparator (U9): descending by aggregate count with a
-	 * lexical name tiebreak. Names absent from the map count zero.
+	 * Pure usage-sort predicate (U9): descending by aggregate count with a
+	 * lexical name tiebreak. Names absent from the map count zero. The ONE
+	 * ordering — the widget's root/sibling sorts and the array sorter below
+	 * all route through it so they cannot drift.
 	 */
+	static bool CompareNamesByAggregateUsage(FName A, FName B, const TMap<FName, int32>& AggregateCounts);
+
+	/** Array form of the same ordering. */
 	static void SortNamesByAggregateUsage(TArray<FName>& Names, const TMap<FName, int32>& AggregateCounts);
 
 	/**

@@ -57,6 +57,8 @@ private:
 	FText GetResaveToolTip() const;
 
 	void HandleTagTreeChanged();
+	/** Package saves stale the results too (via the scan service's tracking). */
+	void HandleScanStateChanged();
 
 	TArray<TSharedPtr<FTagToolboxAuditRow>> Rows;
 	TArray<TSharedPtr<FName>> SelectedReferencers;
@@ -65,6 +67,7 @@ private:
 	TSharedPtr<SListView<TSharedPtr<FName>>> ReferencersList;
 
 	FDelegateHandle TagTreeChangedHandle;
+	FDelegateHandle ScanStateChangedHandle;
 	bool bHasRun = false;
 	/** Armed by any tag-table change after a run; cleared only by re-running. */
 	bool bResultsStale = false;

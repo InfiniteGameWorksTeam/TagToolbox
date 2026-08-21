@@ -10,6 +10,7 @@
 #include "Misc/App.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Styling/AppStyle.h"
+#include "TagToolboxAudit.h"
 #include "TagToolboxSettings.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SEditableTextBox.h"
@@ -224,15 +225,7 @@ FTagToolboxRenamePlan STagToolboxRenameDialog::BuildPlanFromLiveState(FName NewN
 	UGameplayTagsManager& Manager = UGameplayTagsManager::Get();
 
 	// Pre-rename snapshot: the complete table, implicit parents included.
-	TSet<FName> Snapshot;
-	{
-		FGameplayTagContainer AllTags;
-		Manager.RequestAllGameplayTags(AllTags, /*OnlyIncludeDictionaryTags=*/false);
-		for (const FGameplayTag& TableTag : AllTags)
-		{
-			Snapshot.Add(TableTag.GetTagName());
-		}
-	}
+	const TSet<FName> Snapshot = FTagToolboxAudit::CollectAllDefinedTagNames();
 
 	const TArray<FTagToolboxRedirectRecord> AllRedirects = FTagToolboxTagScanService::CollectAllRedirects();
 
@@ -250,9 +243,16 @@ FTagToolboxRenamePlan STagToolboxRenameDialog::BuildPlanFromLiveState(FName NewN
 			SubtreeNameToSource.Add(SubtreeName, SourceName);
 			if (const FGameplayTagSource* Source = Manager.FindTagSource(SourceName))
 			{
-				if (Source->SourceTagList && !Source->SourceTagList->ConfigFileName.IsEmpty())
+				if (Source->SourceTagList)
 				{
-					const FString& ConfigPath = Source->SourceTagList->ConfigFileName;
+					// The default settings list carries no ConfigFileName —
+					// probe its default config file instead of skipping it
+					// (settings-owned state is exactly the tier that cannot
+					// be rolled back in-session, so refusing up front matters
+					// most there).
+					const FString ConfigPath = Source->SourceTagList->ConfigFileName.IsEmpty()
+						? Source->SourceTagList->GetDefaultConfigFilename()
+						: Source->SourceTagList->ConfigFileName;
 					if (!bSourceControlActive && IFileManager::Get().FileExists(*ConfigPath) && IFileManager::Get().IsReadOnly(*ConfigPath))
 					{
 						UnwritableSources.Add(SourceName);
@@ -299,7 +299,8 @@ FTagToolboxRenamePlan STagToolboxRenameDialog::BuildPlanFromLiveState(FName NewN
 	const bool bValidNewName = !NewName.IsNone() && UGameplayTagsManager::Get().IsValidGameplayTagString(NewName.ToString(), &ValidationError, &FixedString);
 
 	return FTagToolboxRenameFixup::BuildPlan(
-		OldTagName, NewName, bValidNewName, Snapshot, AllRedirects,
+		OldTagName, NewName, bValidNewName, Manager.ShouldImportTagsFromINI(),
+		Snapshot, AllRedirects,
 		SubtreeNameToSource, UnwritableSources, StyleTags,
 		ReadNameList(TEXT("BrowserFavorites")), ReadNameList(TEXT("BrowserRecents")),
 		MergeReferencers, MergeChildren);
@@ -310,14 +311,15 @@ void STagToolboxRenameDialog::RefreshPlan()
 	const FString NewNameString = NewNameBox.IsValid() ? NewNameBox->GetText().ToString().TrimStartAndEnd() : FString();
 	Plan = BuildPlanFromLiveState(NewNameString.IsEmpty() ? NAME_None : FName(*NewNameString));
 
-	// Referencer preview: live per-name query over the subtree, with each
-	// package's dirty/loaded/read-only status (R4).
+	// Referencer preview: live per-name query over the FULL verification set
+	// (subtree + chain-reachable old names) so the preview, the resave scope,
+	// and the retirement re-query all cover the same packages (R4).
 	ReferencerRows.Reset();
 	if (Plan.Verdict == ETagToolboxRenameVerdict::Ready
 		|| Plan.Verdict == ETagToolboxRenameVerdict::ReadyMerge
 		|| Plan.Verdict == ETagToolboxRenameVerdict::SkipToResave)
 	{
-		const TMap<FName, TArray<FName>> Referencers = FTagToolboxRenameFixup::QueryLiveReferencers(Plan.SubtreeOldNames);
+		const TMap<FName, TArray<FName>> Referencers = FTagToolboxRenameFixup::QueryLiveReferencers(Plan.RetirementVerificationNames);
 		TSet<FName> Packages;
 		for (const TPair<FName, TArray<FName>>& Pair : Referencers)
 		{

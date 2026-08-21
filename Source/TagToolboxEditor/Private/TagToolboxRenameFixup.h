@@ -115,6 +115,7 @@ struct FTagToolboxRenameFixup
 		FName OldName,
 		FName NewName,
 		bool bNewNameValidTagString,
+		bool bTagSourcesWritable,
 		const TSet<FName>& TagTableSnapshot,
 		const TArray<FTagToolboxRedirectRecord>& AllRedirects,
 		const TMap<FName, FName>& SubtreeNameToSource,

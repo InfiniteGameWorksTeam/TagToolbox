@@ -198,11 +198,29 @@ FTagToolboxResaveReport FTagToolboxResaveService::ExecutePlan(const FTagToolboxR
 			SaveParams.bPromptToSave = false;
 			SaveParams.OutFailedPackages = &FailedDirty;
 			FEditorFileUtils::PromptForCheckoutAndSave(DirtyToSaveFirst, SaveParams);
+
+			// A dirty package whose save-first did NOT complete (failure, or
+			// the engine dialog's mid-batch Cancel) must never be reloaded —
+			// a non-interactive positive reload would silently discard the
+			// user's edits. Ground truth is the save event, not the failed
+			// list: Cancel leaves unattempted packages out of BOTH.
 			for (const UPackage* Failed : FailedDirty)
 			{
 				if (Failed)
 				{
 					FailedPackages.Add(Failed->GetFName());
+				}
+			}
+			for (int32 Index = LoadedToReload.Num() - 1; Index >= 0; --Index)
+			{
+				const UPackage* Package = LoadedToReload[Index];
+				if (DirtyToSaveFirst.Contains(Package) && (!Package || !SavedPackages.Contains(Package->GetFName())))
+				{
+					if (Package)
+					{
+						FailedPackages.Add(Package->GetFName());
+					}
+					LoadedToReload.RemoveAt(Index);
 				}
 			}
 		}
@@ -213,7 +231,21 @@ FTagToolboxResaveReport FTagToolboxResaveService::ExecutePlan(const FTagToolboxR
 		if (LoadedToReload.Num() > 0)
 		{
 			FText ReloadError;
-			UPackageTools::ReloadPackages(LoadedToReload, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
+			const bool bReloaded = UPackageTools::ReloadPackages(LoadedToReload, ReloadError, EReloadPackagesInteractionMode::AssumePositive);
+			if (!bReloaded)
+			{
+				// A failed reload means these packages may still hold the OLD
+				// tag names in memory; saving them would write the old names
+				// back while the report claims they were fixed. Attribute the
+				// whole reload batch as Failed rather than lie.
+				for (const UPackage* Package : LoadedToReload)
+				{
+					if (Package)
+					{
+						FailedPackages.Add(Package->GetFName());
+					}
+				}
+			}
 		}
 
 		// 3) Load the rest.
@@ -245,12 +277,14 @@ FTagToolboxResaveReport FTagToolboxResaveService::ExecutePlan(const FTagToolboxR
 		//    Cancel/Retry/Continue dialog can appear on failure in interactive
 		//    sessions; a mid-batch Cancel leaves the remainder unattempted.
 		SlowTask.EnterProgressFrame(1.0f, LOCTEXT("ResaveSave", "Saving referencers..."));
+
+		// Reset saved tracking for the final attribution UNCONDITIONALLY: the
+		// dirty-first saves wrote the OLD names and must never count as
+		// fixed-up saves, even when nothing survives to the final batch.
+		SavedPackages.Reset();
+
 		if (AllToSave.Num() > 0)
 		{
-			// Reset saved tracking for the final attribution: the dirty-first
-			// saves wrote the OLD names and do not count as fixed-up saves.
-			SavedPackages.Reset();
-
 			TArray<UPackage*> FailedSaves;
 			FEditorFileUtils::FPromptForCheckoutAndSaveParams SaveParams;
 			SaveParams.bCheckDirty = false;

@@ -342,7 +342,12 @@ STagToolboxTagPicker::~STagToolboxTagPicker()
 	UGameplayTagsManager::OnEditorRefreshGameplayTagTree.Remove(TagTreeChangedHandle);
 	if (ScanStateChangedHandle.IsValid())
 	{
-		FTagToolboxTagScanService::Get().OnScanStateChanged.Remove(ScanStateChangedHandle);
+		// TryGet: a destructor running during module shutdown must not
+		// resurrect the service and re-register its delegates.
+		if (FTagToolboxTagScanService* ScanService = FTagToolboxTagScanService::TryGet())
+		{
+			ScanService->OnScanStateChanged.Remove(ScanStateChangedHandle);
+		}
 	}
 }
 
@@ -405,17 +410,22 @@ FText STagToolboxTagPicker::GetCountToolTipText() const
 	}
 }
 
+bool STagToolboxTagPicker::CompareNamesByAggregateUsage(FName A, FName B, const TMap<FName, int32>& AggregateCounts)
+{
+	const int32 CountA = AggregateCounts.FindRef(A);
+	const int32 CountB = AggregateCounts.FindRef(B);
+	if (CountA != CountB)
+	{
+		return CountA > CountB;
+	}
+	return A.LexicalLess(B);
+}
+
 void STagToolboxTagPicker::SortNamesByAggregateUsage(TArray<FName>& Names, const TMap<FName, int32>& AggregateCounts)
 {
 	Names.StableSort([&AggregateCounts](const FName& A, const FName& B)
 	{
-		const int32 CountA = AggregateCounts.FindRef(A);
-		const int32 CountB = AggregateCounts.FindRef(B);
-		if (CountA != CountB)
-		{
-			return CountA > CountB;
-		}
-		return A.LexicalLess(B);
+		return CompareNamesByAggregateUsage(A, B, AggregateCounts);
 	});
 }
 
@@ -466,13 +476,7 @@ void STagToolboxTagPicker::RebuildVisibility()
 	{
 		VisibleRootNodes.StableSort([this](const FTagNodePtr& A, const FTagNodePtr& B)
 		{
-			const int32 CountA = UsageAggregates.FindRef(A->GetCompleteTagName());
-			const int32 CountB = UsageAggregates.FindRef(B->GetCompleteTagName());
-			if (CountA != CountB)
-			{
-				return CountA > CountB;
-			}
-			return A->GetCompleteTagName().LexicalLess(B->GetCompleteTagName());
+			return CompareNamesByAggregateUsage(A->GetCompleteTagName(), B->GetCompleteTagName(), UsageAggregates);
 		});
 	}
 
@@ -883,13 +887,7 @@ void STagToolboxTagPicker::GetChildrenForNode(FTagNodePtr Node, TArray<FTagNodeP
 	{
 		OutChildren.StableSort([this](const FTagNodePtr& A, const FTagNodePtr& B)
 		{
-			const int32 CountA = UsageAggregates.FindRef(A->GetCompleteTagName());
-			const int32 CountB = UsageAggregates.FindRef(B->GetCompleteTagName());
-			if (CountA != CountB)
-			{
-				return CountA > CountB;
-			}
-			return A->GetCompleteTagName().LexicalLess(B->GetCompleteTagName());
+			return CompareNamesByAggregateUsage(A->GetCompleteTagName(), B->GetCompleteTagName(), UsageAggregates);
 		});
 	}
 }
@@ -1101,24 +1099,7 @@ void STagToolboxTagPicker::RebuildRecentsStrip()
 		if (IsSelectionMode() && !RootFilter.IsEmpty())
 		{
 			const FGameplayTag RecentTag = FGameplayTag::RequestGameplayTag(RecentName, /*ErrorIfNotFound=*/false);
-			if (!RecentTag.IsValid())
-			{
-				continue;
-			}
-			TArray<FString> Roots;
-			RootFilter.ParseIntoArray(Roots, TEXT(","), true);
-			bool bInsideFilter = false;
-			const FString RecentString = RecentName.ToString();
-			for (FString& Root : Roots)
-			{
-				Root.TrimStartAndEndInline();
-				if (RecentString == Root || RecentString.StartsWith(Root + TEXT(".")))
-				{
-					bInsideFilter = true;
-					break;
-				}
-			}
-			if (!bInsideFilter)
+			if (!RecentTag.IsValid() || !FTagToolboxTagClipboard::NameMatchesFilter(RecentName.ToString(), RootFilter))
 			{
 				continue;
 			}
