@@ -31,6 +31,7 @@ public class TagToolboxEditor : ModuleRules
 			"Settings",
 			"Slate",
 			"SlateCore",
+			"SourceControl",
 			"ToolMenus",
 			"UnrealEd",
 			"WorkspaceMenuStructure",

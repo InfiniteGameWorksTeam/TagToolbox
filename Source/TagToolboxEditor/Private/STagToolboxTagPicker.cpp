@@ -13,6 +13,7 @@
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "HAL/PlatformApplicationMisc.h"
 #include "Misc/ConfigCacheIni.h"
+#include "STagToolboxRenameDialog.h"
 #include "TagToolboxTagClipboard.h"
 #include "Styling/AppStyle.h"
 #include "TagToolboxColorBridge.h"
@@ -741,6 +742,15 @@ TSharedPtr<SWidget> STagToolboxTagPicker::BuildRowContextMenu()
 		FUIAction(FExecuteAction::CreateLambda([Node]()
 		{
 			FPlatformApplicationMisc::ClipboardCopy(*Node->GetCompleteTagString());
+		})));
+
+	MenuBuilder.AddMenuEntry(
+		LOCTEXT("RenameTag", "Rename Tag (fix up assets)..."),
+		LOCTEXT("RenameTagToolTip", "Rename this tag (children included): previews every referencing package, writes redirects, resaves referencers under consent, verifies, and offers redirect retirement."),
+		FSlateIcon(FAppStyle::GetAppStyleSetName(), "GenericCommands.Rename"),
+		FUIAction(FExecuteAction::CreateLambda([NodeName = Node->GetCompleteTagName()]()
+		{
+			STagToolboxRenameDialog::ShowForTag(NodeName);
 		})));
 
 	MenuBuilder.AddMenuEntry(

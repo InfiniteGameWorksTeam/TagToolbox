@@ -6,6 +6,7 @@
 #include "Misc/AutomationTest.h"
 #include "STagToolboxTagPicker.h"
 #include "TagToolboxAudit.h"
+#include "TagToolboxRenameFixup.h"
 #include "TagToolboxResaveService.h"
 #include "TagToolboxCommentTint.h"
 #include "TagToolboxSettings.h"
@@ -602,6 +603,148 @@ bool FTagToolboxResavePlanTest::RunTest(const FString& Parameters)
 		const FTagToolboxResavePlan EmptyPlan = FTagToolboxResaveService::BuildPlan(TArray<FTagToolboxPackageFacts>());
 		TestEqual(TEXT("No facts produce an empty plan"), EmptyPlan.Entries.Num(), 0);
 		TestEqual(TEXT("Empty plan includes nothing"), EmptyPlan.CountIncluded(), 0);
+	}
+
+	return true;
+}
+
+namespace
+{
+	struct FTagToolboxTest_RenamePlanArgs
+	{
+		FName OldName;
+		FName NewName;
+		bool bNewNameValid = true;
+		TSet<FName> Snapshot;
+		TArray<FTagToolboxRedirectRecord> Redirects;
+		TMap<FName, FName> NameToSource;
+		TSet<FName> UnwritableSources;
+		TArray<FGameplayTag> Styles;
+		TArray<FName> Favorites;
+		TArray<FName> Recents;
+		int32 MergeRefs = 0;
+		int32 MergeChildren = 0;
+	};
+
+	FTagToolboxRenamePlan TagToolboxTest_BuildRenamePlan(const FTagToolboxTest_RenamePlanArgs& Args)
+	{
+		return FTagToolboxRenameFixup::BuildPlan(Args.OldName, Args.NewName, Args.bNewNameValid, Args.Snapshot,
+			Args.Redirects, Args.NameToSource, Args.UnwritableSources, Args.Styles, Args.Favorites, Args.Recents,
+			Args.MergeRefs, Args.MergeChildren);
+	}
+
+	FTagToolboxRedirectRecord TagToolboxTest_Redirect(const TCHAR* OldName, const TCHAR* NewName)
+	{
+		FTagToolboxRedirectRecord Record;
+		Record.OldTagName = FName(OldName);
+		Record.NewTagName = FName(NewName);
+		Record.OwningSourceName = FName(TEXT("TestSource.ini"));
+		return Record;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxRenamePlanBuildTest,
+	"TagToolbox.Rename.PlanVerdictsAndPayloads",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxRenamePlanBuildTest::RunTest(const FString& Parameters)
+{
+	// DeriveRenamedName: parent, child, deep child, non-member identity.
+	TestEqual(TEXT("Parent renames to the target"), FTagToolboxRenameFixup::DeriveRenamedName(FName(TEXT("A.B")), FName(TEXT("A.B")), FName(TEXT("C.D"))), FName(TEXT("C.D")));
+	TestEqual(TEXT("Child re-roots under the target"), FTagToolboxRenameFixup::DeriveRenamedName(FName(TEXT("A.B.X")), FName(TEXT("A.B")), FName(TEXT("C.D"))), FName(TEXT("C.D.X")));
+	TestEqual(TEXT("Deep child keeps its suffix"), FTagToolboxRenameFixup::DeriveRenamedName(FName(TEXT("A.B.X.Y")), FName(TEXT("A.B")), FName(TEXT("C.D"))), FName(TEXT("C.D.X.Y")));
+	TestEqual(TEXT("Non-member is identity"), FTagToolboxRenameFixup::DeriveRenamedName(FName(TEXT("A.Bc")), FName(TEXT("A.B")), FName(TEXT("C.D"))), FName(TEXT("A.Bc")));
+
+	FTagToolboxTest_RenamePlanArgs Base;
+	Base.OldName = FName(TEXT("Combat.Heavy"));
+	Base.NewName = FName(TEXT("Combat.Strong"));
+	Base.Snapshot = { FName(TEXT("Combat")), FName(TEXT("Combat.Heavy")), FName(TEXT("Combat.Heavy.Spin")), FName(TEXT("Combat.Light")) };
+	Base.NameToSource.Add(FName(TEXT("Combat.Heavy")), FName(TEXT("MainTags.ini")));
+	Base.NameToSource.Add(FName(TEXT("Combat.Heavy.Spin")), FName(TEXT("SpinTags.ini")));
+
+	// Ordinary rename: subtree from the snapshot, mapping derived.
+	{
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Base);
+		TestEqual(TEXT("Ordinary rename is Ready"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::Ready));
+		TestEqual(TEXT("Subtree expands from the snapshot"), Plan.SubtreeOldNames.Num(), 2);
+		TestEqual(TEXT("Child maps to the re-rooted name"), Plan.OldToNewNames.FindRef(FName(TEXT("Combat.Heavy.Spin"))), FName(TEXT("Combat.Strong.Spin")));
+		TestEqual(TEXT("Verification covers the subtree"), Plan.RetirementVerificationNames.Num(), 2);
+	}
+
+	// Merge target detected with the confirm payload.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.NewName = FName(TEXT("Combat.Light"));
+		Args.MergeRefs = 7;
+		Args.MergeChildren = 2;
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Existing target yields ReadyMerge"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::ReadyMerge));
+		TestEqual(TEXT("Merge confirm carries referencer count"), Plan.MergeTargetReferencerCount, 7);
+		TestEqual(TEXT("Merge confirm carries child count"), Plan.MergeTargetChildCount, 2);
+		TestFalse(TEXT("Merge warning text present"), Plan.VerdictReason.IsEmpty());
+	}
+
+	// Cycles refuse in both directions, naming the relationship.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.NewName = FName(TEXT("Combat.Heavy.Spin.New"));
+		TestEqual(TEXT("Rename into own subtree refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedCycle));
+		Args.NewName = FName(TEXT("Combat"));
+		TestEqual(TEXT("Rename onto own ancestor refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedCycle));
+	}
+
+	// Chain A→B plus rename of B: the chain collapses and A joins verification.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.OldHeavy"), TEXT("Combat.Heavy")));
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Chain into the subtree collapses"), Plan.ChainsToCollapse.Num(), 1);
+		TestTrue(TEXT("Chain-reachable old name verifies before retirement"), Plan.RetirementVerificationNames.Contains(FName(TEXT("Combat.OldHeavy"))));
+		TestEqual(TEXT("Verification set = subtree + chain"), Plan.RetirementVerificationNames.Num(), 3);
+	}
+
+	// Any read-only descendant source refuses the WHOLE rename, named.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.UnwritableSources.Add(FName(TEXT("SpinTags.ini")));
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Unwritable descendant source refuses whole subtree"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedUnwritableSource));
+		TestTrue(TEXT("Refusal names the blocking source"), Plan.UnwritableSources.Contains(FName(TEXT("SpinTags.ini"))));
+	}
+
+	// Recovery: old name gone but already redirecting to the target.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Snapshot.Remove(FName(TEXT("Combat.Heavy")));
+		Args.Snapshot.Remove(FName(TEXT("Combat.Heavy.Spin")));
+		Args.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Heavy"), TEXT("Combat.Strong")));
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Recovery input skips to resave"), static_cast<int32>(Plan.Verdict), static_cast<int32>(ETagToolboxRenameVerdict::SkipToResave));
+		// A redirecting-elsewhere old name is NOT recovery.
+		FTagToolboxTest_RenamePlanArgs Wrong = Args;
+		Wrong.Redirects.Reset();
+		Wrong.Redirects.Add(TagToolboxTest_Redirect(TEXT("Combat.Heavy"), TEXT("Somewhere.Else")));
+		TestEqual(TEXT("Old name redirecting elsewhere refuses"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Wrong).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
+	}
+
+	// Plugin-store fixup lists exactly the affected entries.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.Favorites = { FName(TEXT("Combat.Heavy")), FName(TEXT("Combat.Light")) };
+		Args.Recents = { FName(TEXT("Combat.Heavy.Spin")), FName(TEXT("Movement.Run")) };
+		const FTagToolboxRenamePlan Plan = TagToolboxTest_BuildRenamePlan(Args);
+		TestEqual(TEXT("Affected favorites exact"), Plan.AffectedFavorites.Num(), 1);
+		TestEqual(TEXT("Affected recents exact"), Plan.AffectedRecents.Num(), 1);
+		TestTrue(TEXT("Unaffected favorite untouched"), !Plan.AffectedFavorites.Contains(FName(TEXT("Combat.Light"))));
+	}
+
+	// Same-name and invalid-name refusals.
+	{
+		FTagToolboxTest_RenamePlanArgs Args = Base;
+		Args.NewName = FName(TEXT("combat.heavy"));
+		TestEqual(TEXT("Case-only rename refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
+		Args.NewName = FName(TEXT("Combat.Strong"));
+		Args.bNewNameValid = false;
+		TestEqual(TEXT("Invalid new name refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
 	}
 
 	return true;
