@@ -25,6 +25,22 @@ struct FTagToolboxAuditRow
 	FString Detail;
 	/** Packages whose saved data references Tag, when the category has any. */
 	TArray<FName> ReferencerPackages;
+	/** The redirect's target, for the redirect categories (else NAME_None). */
+	FName RedirectTarget;
+};
+
+/** Why a proposed Create Redirect target is refused (Ok = accepted). */
+enum class ETagToolboxRedirectTargetVerdict : uint8
+{
+	Ok,
+	/** The target must be a defined tag — redirecting into a void breaks loads. */
+	TargetUndefined,
+	/** The target is itself a redirect old-name — chains do not resolve. */
+	TargetIsRedirectOldName,
+	/** Old and target are the same name. */
+	SelfRedirect,
+	/** The old name already has a redirect in SOME source list. */
+	DuplicateOldName,
 };
 
 /**
@@ -57,6 +73,31 @@ struct FTagToolboxAudit
 	 * occurs between distinct siblings).
 	 */
 	static bool AreNamesNearDuplicate(const FString& A, const FString& B);
+
+	/**
+	 * Pure post-delete refusal diff: requested tags that are STILL explicitly
+	 * defined were refused (the engine refuses referenced tags itself). A
+	 * deleted parent surviving only implicitly through children counts as
+	 * deleted — pass the still-EXPLICIT set, not mere resolvability.
+	 */
+	static void DiffRefusedDeletions(
+		const TArray<FName>& RequestedTags,
+		const TSet<FName>& StillExplicitlyDefined,
+		TArray<FName>& OutDeleted,
+		TArray<FName>& OutRefused);
+
+	/**
+	 * Pure Create Redirect target validation (R8): target defined, not itself
+	 * a redirect old-name, not the old name, and the old name not already
+	 * redirected in ANY aggregated source list.
+	 */
+	static ETagToolboxRedirectTargetVerdict ValidateRedirectTarget(
+		FName OldName,
+		FName TargetName,
+		const TSet<FName>& DefinedTags,
+		const TSet<FName>& AggregatedRedirectOldNames);
+
+	static FText GetRedirectTargetVerdictText(ETagToolboxRedirectTargetVerdict Verdict);
 
 	/**
 	 * Runs the complete audit against the editor Asset Registry. Never loads

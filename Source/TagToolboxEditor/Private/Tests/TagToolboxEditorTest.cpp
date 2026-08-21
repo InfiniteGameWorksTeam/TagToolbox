@@ -8,6 +8,7 @@
 #include "TagToolboxAudit.h"
 #include "TagToolboxRenameFixup.h"
 #include "TagToolboxResaveService.h"
+#include "TagToolboxTagAuditCommandlet.h"
 #include "TagToolboxCommentTint.h"
 #include "TagToolboxSettings.h"
 #include "TagToolboxTagClipboard.h"
@@ -745,6 +746,179 @@ bool FTagToolboxRenamePlanBuildTest::RunTest(const FString& Parameters)
 		Args.NewName = FName(TEXT("Combat.Strong"));
 		Args.bNewNameValid = false;
 		TestEqual(TEXT("Invalid new name refused"), static_cast<int32>(TagToolboxTest_BuildRenamePlan(Args).Verdict), static_cast<int32>(ETagToolboxRenameVerdict::RefusedInvalid));
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxAuditActionsTest,
+	"TagToolbox.Audit.DeleteDiffAndRedirectValidation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxAuditActionsTest::RunTest(const FString& Parameters)
+{
+	// --- Post-delete refusal diffing: requested-vs-still-explicit → exact sets.
+	{
+		const TArray<FName> Requested = { FName(TEXT("A.One")), FName(TEXT("A.Two")), FName(TEXT("A.Three")) };
+		const TSet<FName> StillExplicit = { FName(TEXT("A.Two")) };
+		TArray<FName> Deleted;
+		TArray<FName> Refused;
+		FTagToolboxAudit::DiffRefusedDeletions(Requested, StillExplicit, Deleted, Refused);
+		TestEqual(TEXT("Deleted set exact"), Deleted.Num(), 2);
+		TestEqual(TEXT("Refused set exact"), Refused.Num(), 1);
+		if (Refused.Num() == 1)
+		{
+			TestEqual(TEXT("Refused names the surviving tag"), Refused[0], FName(TEXT("A.Two")));
+		}
+		// A parent surviving only implicitly is NOT in the still-explicit set,
+		// so it correctly lands in Deleted.
+		TestTrue(TEXT("Implicit survivor counts deleted"), Deleted.Contains(FName(TEXT("A.One"))));
+	}
+
+	// --- Create-redirect validation matrix (R8).
+	{
+		const TSet<FName> Defined = { FName(TEXT("Combat.Heavy")), FName(TEXT("Combat.Light")) };
+		const TSet<FName> RedirectOldNames = { FName(TEXT("Combat.Old")), FName(TEXT("Combat.Ancient")) };
+		const FName OldName(TEXT("Combat.Missing"));
+
+		TestEqual(TEXT("Defined target accepted"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(OldName, FName(TEXT("Combat.Heavy")), Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::Ok));
+		TestEqual(TEXT("Undefined target refused"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(OldName, FName(TEXT("Combat.Nope")), Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::TargetUndefined));
+		TestEqual(TEXT("Redirect-old-name target refused"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(OldName, FName(TEXT("Combat.Old")), Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::TargetIsRedirectOldName));
+		TestEqual(TEXT("Self target refused"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(OldName, OldName, Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::SelfRedirect));
+		TestEqual(TEXT("None target refused as self"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(OldName, NAME_None, Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::SelfRedirect));
+		TestEqual(TEXT("Already-redirected old name refused across aggregated sources"),
+			static_cast<int32>(FTagToolboxAudit::ValidateRedirectTarget(FName(TEXT("Combat.Ancient")), FName(TEXT("Combat.Heavy")), Defined, RedirectOldNames)),
+			static_cast<int32>(ETagToolboxRedirectTargetVerdict::DuplicateOldName));
+
+		TestTrue(TEXT("Refusals carry reason text"), !FTagToolboxAudit::GetRedirectTargetVerdictText(ETagToolboxRedirectTargetVerdict::TargetUndefined).IsEmpty());
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxUsageSortTest,
+	"TagToolbox.Picker.UsageAggregatesAndSort",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxUsageSortTest::RunTest(const FString& Parameters)
+{
+	// Aggregates: each exact count max-updates itself and every ancestor.
+	TMap<FName, TArray<FName>> Referenced;
+	Referenced.Add(FName(TEXT("Combat.Heavy.Spin")), { FName(TEXT("/Game/A")), FName(TEXT("/Game/B")), FName(TEXT("/Game/C")) });
+	Referenced.Add(FName(TEXT("Combat.Light")), { FName(TEXT("/Game/A")) });
+	Referenced.Add(FName(TEXT("Movement")), { FName(TEXT("/Game/A")), FName(TEXT("/Game/B")) });
+
+	const TMap<FName, int32> Aggregates = STagToolboxTagPicker::BuildUsageAggregates(Referenced);
+	TestEqual(TEXT("Leaf keeps its exact count"), Aggregates.FindRef(FName(TEXT("Combat.Heavy.Spin"))), 3);
+	TestEqual(TEXT("Parent lifts to the hot leaf"), Aggregates.FindRef(FName(TEXT("Combat.Heavy"))), 3);
+	TestEqual(TEXT("Root lifts to the hot leaf"), Aggregates.FindRef(FName(TEXT("Combat"))), 3);
+	TestEqual(TEXT("Sibling keeps its own count"), Aggregates.FindRef(FName(TEXT("Combat.Light"))), 1);
+	TestEqual(TEXT("Unrelated root unaffected"), Aggregates.FindRef(FName(TEXT("Movement"))), 2);
+	TestEqual(TEXT("Absent name reads zero"), Aggregates.FindRef(FName(TEXT("Zzz"))), 0);
+
+	// Comparator: descending by aggregate, lexical tiebreak, absent-last.
+	TArray<FName> Names = { FName(TEXT("Movement")), FName(TEXT("Combat")), FName(TEXT("Interface")), FName(TEXT("Audio")) };
+	TMap<FName, int32> SortCounts;
+	SortCounts.Add(FName(TEXT("Combat")), 3);
+	SortCounts.Add(FName(TEXT("Movement")), 2);
+	SortCounts.Add(FName(TEXT("Audio")), 2);
+	STagToolboxTagPicker::SortNamesByAggregateUsage(Names, SortCounts);
+	TestEqual(TEXT("Highest aggregate first"), Names[0], FName(TEXT("Combat")));
+	TestEqual(TEXT("Tie breaks lexically"), Names[1], FName(TEXT("Audio")));
+	TestEqual(TEXT("Tie breaks lexically (second)"), Names[2], FName(TEXT("Movement")));
+	TestEqual(TEXT("Uncounted name sorts last"), Names[3], FName(TEXT("Interface")));
+
+	return true;
+}
+
+namespace
+{
+	TSharedPtr<FTagToolboxAuditRow> TagToolboxTest_AuditRow(ETagToolboxAuditCategory Category, const TCHAR* InTagName, std::initializer_list<const TCHAR*> Referencers = {})
+	{
+		TSharedPtr<FTagToolboxAuditRow> Row = MakeShared<FTagToolboxAuditRow>();
+		Row->Category = Category;
+		Row->Tag = FName(InTagName);
+		Row->Detail = FString::Printf(TEXT("detail for %s"), InTagName);
+		for (const TCHAR* Referencer : Referencers)
+		{
+			Row->ReferencerPackages.Add(FName(Referencer));
+		}
+		return Row;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxAuditReportTest,
+	"TagToolbox.Commandlet.ReportScopeAndSeverity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxAuditReportTest::RunTest(const FString& Parameters)
+{
+	TArray<TSharedPtr<FTagToolboxAuditRow>> Rows;
+	Rows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::ReferencedUndefined, TEXT("Combat.Gone"), { TEXT("/Game/A"), TEXT("/Engine/E"), TEXT("/SomePlugin/P") }));
+	Rows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::ReferencedUndefined, TEXT("Combat.PluginOnly"), { TEXT("/SomePlugin/P") }));
+	Rows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::LingeringRedirect, TEXT("Combat.Old"), { TEXT("/Game/B") }));
+	Rows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::UnusedDefined, TEXT("Combat.Idle")));
+	Rows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::BrokenRedirect, TEXT("Combat.Broken")));
+
+	// --- Scope: default (game only) drops out-of-scope referencers and whole
+	// rows whose referencers all fall out; definition-side rows pass through.
+	FTagToolboxAuditReportOptions DefaultOptions;
+	const TArray<TSharedPtr<FTagToolboxAuditRow>> Scoped = FTagToolboxAuditReportBuilder::ApplyScope(Rows, DefaultOptions);
+	TestEqual(TEXT("Plugin-only referencer row dropped in default scope"), Scoped.Num(), 4);
+	for (const TSharedPtr<FTagToolboxAuditRow>& Row : Scoped)
+	{
+		if (Row->Tag == FName(TEXT("Combat.Gone")))
+		{
+			TestEqual(TEXT("Out-of-scope referencers filtered"), Row->ReferencerPackages.Num(), 1);
+			TestEqual(TEXT("Game referencer kept"), Row->ReferencerPackages[0], FName(TEXT("/Game/A")));
+		}
+		TestTrue(TEXT("Plugin-only row absent"), Row->Tag != FName(TEXT("Combat.PluginOnly")));
+	}
+	{
+		FTagToolboxAuditReportOptions Widened;
+		Widened.bIncludePluginContent = true;
+		TestEqual(TEXT("Widened scope keeps the plugin-only row"), FTagToolboxAuditReportBuilder::ApplyScope(Rows, Widened).Num(), 5);
+	}
+
+	// --- Severity: default fails ONLY referenced-but-undefined.
+	TestTrue(TEXT("Undefined always fails"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::ReferencedUndefined, DefaultOptions));
+	TestFalse(TEXT("Unused passes by default"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::UnusedDefined, DefaultOptions));
+	TestFalse(TEXT("Lingering passes by default"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::LingeringRedirect, DefaultOptions));
+	TestFalse(TEXT("Broken passes by default"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::BrokenRedirect, DefaultOptions));
+	TestFalse(TEXT("Near-duplicate passes by default"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::NearDuplicate, DefaultOptions));
+	{
+		FTagToolboxAuditReportOptions Escalated;
+		Escalated.bFailOnUnused = true;
+		Escalated.bFailOnBrokenRedirects = true;
+		Escalated.bFailOnLingeringRedirects = true;
+		Escalated.bFailOnNearDuplicates = true;
+		TestTrue(TEXT("Unused escalates"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::UnusedDefined, Escalated));
+		TestTrue(TEXT("Broken escalates"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::BrokenRedirect, Escalated));
+		TestTrue(TEXT("Lingering escalates"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::LingeringRedirect, Escalated));
+		TestTrue(TEXT("Near-duplicate escalates"), FTagToolboxAuditReportBuilder::CategoryFails(ETagToolboxAuditCategory::NearDuplicate, Escalated));
+	}
+
+	// --- Report: schema present, verdict from severity, deterministic text.
+	const FString StartedUtc = TEXT("2026-08-20T12:00:00Z");
+	const FString FinishedUtc = TEXT("2026-08-20T12:00:05Z");
+	const FString JsonA = FTagToolboxAuditReportBuilder::GenerateJson(Scoped, DefaultOptions, StartedUtc, FinishedUtc);
+	const FString JsonB = FTagToolboxAuditReportBuilder::GenerateJson(Scoped, DefaultOptions, StartedUtc, FinishedUtc);
+	TestEqual(TEXT("Report is deterministic across runs"), JsonA, JsonB);
+	TestTrue(TEXT("Schema version present"), JsonA.Contains(TEXT("\"schema_version\": 1")));
+	TestTrue(TEXT("Default severity fails on undefined"), JsonA.Contains(TEXT("\"failed\": true")));
+	{
+		// Without any undefined rows the default severity passes.
+		TArray<TSharedPtr<FTagToolboxAuditRow>> PassingRows;
+		PassingRows.Add(TagToolboxTest_AuditRow(ETagToolboxAuditCategory::UnusedDefined, TEXT("Combat.Idle")));
+		const FString PassingJson = FTagToolboxAuditReportBuilder::GenerateJson(PassingRows, DefaultOptions, StartedUtc, FinishedUtc);
+		TestTrue(TEXT("Unused-only report passes by default"), PassingJson.Contains(TEXT("\"failed\": false")));
 	}
 
 	return true;

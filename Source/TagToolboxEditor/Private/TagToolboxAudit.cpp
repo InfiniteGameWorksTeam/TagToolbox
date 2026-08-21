@@ -104,6 +104,67 @@ bool FTagToolboxAudit::AreNamesNearDuplicate(const FString& A, const FString& B)
 	return true;
 }
 
+void FTagToolboxAudit::DiffRefusedDeletions(
+	const TArray<FName>& RequestedTags,
+	const TSet<FName>& StillExplicitlyDefined,
+	TArray<FName>& OutDeleted,
+	TArray<FName>& OutRefused)
+{
+	OutDeleted.Reset();
+	OutRefused.Reset();
+	for (const FName& Requested : RequestedTags)
+	{
+		if (StillExplicitlyDefined.Contains(Requested))
+		{
+			OutRefused.Add(Requested);
+		}
+		else
+		{
+			OutDeleted.Add(Requested);
+		}
+	}
+	TagToolboxAuditInternal::SortNames(OutDeleted);
+	TagToolboxAuditInternal::SortNames(OutRefused);
+}
+
+ETagToolboxRedirectTargetVerdict FTagToolboxAudit::ValidateRedirectTarget(
+	FName OldName,
+	FName TargetName,
+	const TSet<FName>& DefinedTags,
+	const TSet<FName>& AggregatedRedirectOldNames)
+{
+	if (TargetName.IsNone() || OldName == TargetName)
+	{
+		return ETagToolboxRedirectTargetVerdict::SelfRedirect;
+	}
+	if (AggregatedRedirectOldNames.Contains(OldName))
+	{
+		return ETagToolboxRedirectTargetVerdict::DuplicateOldName;
+	}
+	if (AggregatedRedirectOldNames.Contains(TargetName))
+	{
+		return ETagToolboxRedirectTargetVerdict::TargetIsRedirectOldName;
+	}
+	if (!DefinedTags.Contains(TargetName))
+	{
+		return ETagToolboxRedirectTargetVerdict::TargetUndefined;
+	}
+	return ETagToolboxRedirectTargetVerdict::Ok;
+}
+
+FText FTagToolboxAudit::GetRedirectTargetVerdictText(ETagToolboxRedirectTargetVerdict Verdict)
+{
+	switch (Verdict)
+	{
+	case ETagToolboxRedirectTargetVerdict::Ok:                     return FText::GetEmpty();
+	case ETagToolboxRedirectTargetVerdict::TargetUndefined:        return LOCTEXT("TargetUndefined", "The redirect target must be a defined tag.");
+	case ETagToolboxRedirectTargetVerdict::TargetIsRedirectOldName: return LOCTEXT("TargetIsOldName", "The chosen target is itself a redirected old name — chains do not resolve.");
+	case ETagToolboxRedirectTargetVerdict::SelfRedirect:           return LOCTEXT("SelfRedirect", "A tag cannot redirect to itself.");
+	case ETagToolboxRedirectTargetVerdict::DuplicateOldName:       return LOCTEXT("DuplicateOldName", "This name already has a redirect in one of the tag source lists.");
+	default:                                                       return FText::GetEmpty();
+	}
+}
+
 TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDialog)
 {
 	using namespace TagToolboxAuditInternal;
@@ -193,10 +254,11 @@ TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDi
 			TSharedPtr<FTagToolboxAuditRow> Row = MakeShared<FTagToolboxAuditRow>();
 			Row->Category = ETagToolboxAuditCategory::LingeringRedirect;
 			Row->Tag = TagName;
+			Row->RedirectTarget = RedirectOldToNew.FindRef(TagName);
 			Row->ReferencerPackages = ReferencedTagToPackages.FindRef(TagName);
 			TagToolboxAuditInternal::SortNames(Row->ReferencerPackages);
 			Row->Detail = FString::Printf(TEXT("Old name still referenced by %d package(s); redirects to %s. Resave those packages to retire the redirect."),
-				Row->ReferencerPackages.Num(), *RedirectOldToNew.FindRef(TagName).ToString());
+				Row->ReferencerPackages.Num(), *Row->RedirectTarget.ToString());
 			Rows.Add(MoveTemp(Row));
 		}
 	}
@@ -209,6 +271,7 @@ TArray<TSharedPtr<FTagToolboxAuditRow>> FTagToolboxAudit::RunAudit(bool bAllowDi
 			TSharedPtr<FTagToolboxAuditRow> Row = MakeShared<FTagToolboxAuditRow>();
 			Row->Category = ETagToolboxAuditCategory::BrokenRedirect;
 			Row->Tag = Redirect.Key;
+			Row->RedirectTarget = Redirect.Value;
 			Row->Detail = FString::Printf(TEXT("GameplayTagRedirects entry points at undefined tag %s."), *Redirect.Value.ToString());
 			Rows.Add(MoveTemp(Row));
 		}
