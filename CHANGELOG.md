@@ -1,6 +1,8 @@
 # Tag Toolbox Changelog
 
-## Unreleased — targeting v0.1.0
+## Unreleased — targeting v0.2.0
+
+## v0.1.0 — 2026-08-20
 
 ### Added
 - MIT license; standalone repository documentation (designer guide, architecture) and an in-repo Backlog.md-format backlog, decoupling the plugin from its development host.
