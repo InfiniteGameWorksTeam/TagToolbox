@@ -1,6 +1,7 @@
 // Copyright Infinite Game Works. All Rights Reserved.
 
 #include "TagToolboxVariableFilterCustomization.h"
+#include "TagToolboxUndo.h"
 
 #include "BlueprintEditorModule.h"
 #include "DetailCategoryBuilder.h"
@@ -133,14 +134,9 @@ void FTagToolboxVariableFilterCustomization::CustomizeDetails(IDetailLayoutBuild
 			FString ContainerString = CurrentFilter->ToStringSimple();
 			ContainerString.ReplaceInline(TEXT(" "), TEXT(""));
 
-			if (!CurrentFilter->IsEmpty())
-			{
-				FBlueprintEditorUtils::SetBlueprintVariableMetaData(CommitBlueprint, VarName, WeakScope.Get(), TEXT("Categories"), ContainerString);
-			}
-			else
-			{
-				FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(CommitBlueprint, VarName, WeakScope.Get(), TEXT("Categories"));
-			}
+			// Undoable (the engine setter alone records nothing).
+			TagToolboxUndo::SetVariableCategories(CommitBlueprint, VarName, WeakScope.Get(),
+				CurrentFilter->IsEmpty() ? FString() : ContainerString);
 		};
 
 		const FText FilterToolTip = LOCTEXT("TagFilterToolTip",

@@ -1,9 +1,9 @@
 // Copyright Infinite Game Works. All Rights Reserved.
 
 #include "GameplayTagContainer.h"
-#include "GameplayTagsManager.h"
 #include "GameplayTagsSettings.h"
 #include "Misc/AutomationTest.h"
+#include "NativeGameplayTags.h"
 #include "STagToolboxTagPicker.h"
 #include "TagToolboxAudit.h"
 #include "TagToolboxRenameFixup.h"
@@ -13,6 +13,13 @@
 #include "TagToolboxSettings.h"
 #include "TagToolboxTagClipboard.h"
 #include "TagToolboxTagScanService.h"
+#include "TagToolboxUndo.h"
+#include "Editor.h"
+#include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "EdGraphSchema_K2.h"
 #include "TagToolboxVariableFilterCustomization.h"
 #include "UObject/UnrealType.h"
 
@@ -20,27 +27,38 @@
 
 // Unity-build rule: every helper in this file carries the TagToolboxTest_ prefix.
 
-namespace
+struct FTagToolboxTestTagHierarchy
 {
-	FGameplayTag TagToolboxTest_RequestTag(const TCHAR* TagName)
-	{
-		return FGameplayTag::RequestGameplayTag(FName(TagName), /*ErrorIfNotFound=*/false);
-	}
-}
+	FNativeGameplayTag AnimationNative {
+		UE_PLUGIN_NAME, FName(TEXT("TagToolbox")), TEXT("TagToolbox.Test.Animation"),
+		TEXT("TagToolbox automation fixture"), ENativeGameplayTagToken::PRIVATE_USE_MACRO_INSTEAD };
+	FNativeGameplayTag CombatNative {
+		UE_PLUGIN_NAME, FName(TEXT("TagToolbox")), TEXT("TagToolbox.Test.Animation.Combat"),
+		TEXT("TagToolbox automation fixture"), ENativeGameplayTagToken::PRIVATE_USE_MACRO_INSTEAD };
+	FNativeGameplayTag HeavyNative {
+		UE_PLUGIN_NAME, FName(TEXT("TagToolbox")), TEXT("TagToolbox.Test.Animation.Combat.Heavy"),
+		TEXT("TagToolbox automation fixture"), ENativeGameplayTagToken::PRIVATE_USE_MACRO_INSTEAD };
+
+	FGameplayTag Animation() const { return AnimationNative.GetTag(); }
+	FGameplayTag Combat() const { return CombatNative.GetTag(); }
+	FGameplayTag Heavy() const { return HeavyNative.GetTag(); }
+};
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxStyleResolveFallUpTest,
 	"TagToolbox.Styles.ResolveFallUp",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FTagToolboxStyleResolveFallUpTest::RunTest(const FString& Parameters)
 {
-	// Host-registered tags: the ancestor walk needs a real registered hierarchy.
-	const FGameplayTag Animation = TagToolboxTest_RequestTag(TEXT("Paper2DPlus.Animation"));
-	const FGameplayTag Combat = TagToolboxTest_RequestTag(TEXT("Paper2DPlus.Animation.Combat"));
-	const FGameplayTag Heavy = TagToolboxTest_RequestTag(TEXT("Paper2DPlus.Animation.Combat.Heavy"));
-	if (!Animation.IsValid() || !Combat.IsValid() || !Heavy.IsValid())
+	// FNativeGameplayTag unregisters on scope exit, so this test neither depends on host vocabulary nor
+	// leaves automation-only tags in a long-lived editor process.
+	const FTagToolboxTestTagHierarchy Tags;
+	const FGameplayTag Animation = Tags.Animation();
+	const FGameplayTag Combat = Tags.Combat();
+	const FGameplayTag Heavy = Tags.Heavy();
+	if (!TestTrue(TEXT("automation-local tag hierarchy registered successfully"),
+		Animation.IsValid() && Combat.IsValid() && Heavy.IsValid()))
 	{
-		AddInfo(TEXT("Skipping: the Paper2DPlus.Animation tag hierarchy is not registered in this host project."));
-		return true;
+		return false;
 	}
 
 	const FLinearColor Red(1.0f, 0.0f, 0.0f);
@@ -81,6 +99,76 @@ bool FTagToolboxStyleResolveFallUpTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Empty style list resolves nothing"), UTagToolboxSettings::ResolveTagColorFromArray(TArray<FTagToolboxTagStyle>(), Heavy, Resolved));
 	TestFalse(TEXT("Invalid tag resolves nothing"), UTagToolboxSettings::ResolveTagColorFromArray(Styles, FGameplayTag(), Resolved));
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FTagToolboxVariableFilterUndoTest,
+	"TagToolbox.Undo.VariableFilterRoundTrip",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FTagToolboxVariableFilterUndoTest::RunTest(const FString& Parameters)
+{
+	// Undo is the caller-visible contract: the engine metadata setter records nothing on its own,
+	// so this test fails if SetVariableCategories stops transacting the Blueprint.
+	if (!TestTrue(TEXT("editor transaction buffer required"), GEditor != nullptr && GEditor->Trans != nullptr))
+	{
+		return false;
+	}
+
+	UPackage* Package = GetTransientPackage();
+	UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(UObject::StaticClass(), Package,
+		MakeUniqueObjectName(Package, UBlueprint::StaticClass(), TEXT("TagToolboxTest_UndoBP")),
+		BPTYPE_Normal, UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass());
+	if (!TestNotNull(TEXT("transient Blueprint created"), Blueprint))
+	{
+		return false;
+	}
+
+	FEdGraphPinType TagPinType;
+	TagPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+	TagPinType.PinSubCategoryObject = FGameplayTag::StaticStruct();
+	const FName VarName(TEXT("TestTag"));
+	if (!TestTrue(TEXT("member variable added"), FBlueprintEditorUtils::AddMemberVariable(Blueprint, VarName, TagPinType)))
+	{
+		return false;
+	}
+
+	auto ReadCategories = [&]() -> FString
+	{
+		FString Value;
+		FBlueprintEditorUtils::GetBlueprintVariableMetaData(Blueprint, VarName, nullptr, TEXT("Categories"), Value);
+		return Value;
+	};
+
+	// Two committed edits: the undo stack must peel them back one at a time.
+	TagToolboxUndo::SetVariableCategories(Blueprint, VarName, nullptr, TEXT("TagToolbox.Test.Animation"));
+	TestEqual(TEXT("first filter written"), ReadCategories(), FString(TEXT("TagToolbox.Test.Animation")));
+
+	TagToolboxUndo::SetVariableCategories(Blueprint, VarName, nullptr, TEXT("TagToolbox.Test.Animation.Combat"));
+	TestEqual(TEXT("second filter written"), ReadCategories(), FString(TEXT("TagToolbox.Test.Animation.Combat")));
+
+	TestTrue(TEXT("undo #1 succeeds"), GEditor->UndoTransaction());
+	TestEqual(TEXT("undo restores the first filter"), ReadCategories(), FString(TEXT("TagToolbox.Test.Animation")));
+
+	TestTrue(TEXT("undo #2 succeeds"), GEditor->UndoTransaction());
+	TestEqual(TEXT("undo restores no filter"), ReadCategories(), FString());
+
+	TestTrue(TEXT("redo succeeds"), GEditor->RedoTransaction());
+	TestEqual(TEXT("redo reapplies the first filter"), ReadCategories(), FString(TEXT("TagToolbox.Test.Animation")));
+
+	// Clearing is its own undoable step.
+	TagToolboxUndo::SetVariableCategories(Blueprint, VarName, nullptr, FString());
+	TestEqual(TEXT("clear removes the filter"), ReadCategories(), FString());
+	TestTrue(TEXT("undo of clear succeeds"), GEditor->UndoTransaction());
+	TestEqual(TEXT("undo of clear restores the filter"), ReadCategories(), FString(TEXT("TagToolbox.Test.Animation")));
+
+	// The undo client keys on exact contexts so unrelated transactions never trigger a skeleton regen.
+	TestTrue(TEXT("filter context recognized"), TagToolboxUndo::IsVariableFilterTransaction(TEXT("TagToolbox.VariableFilter")));
+	TestFalse(TEXT("style context is not a filter context"), TagToolboxUndo::IsVariableFilterTransaction(TEXT("TagToolbox.TagStyle")));
+	TestFalse(TEXT("foreign context ignored"), TagToolboxUndo::IsTagStyleTransaction(TEXT("")));
+
+	// Leave the transaction buffer as found for whoever runs next.
+	GEditor->Trans->Reset(FText::FromString(TEXT("TagToolbox undo test cleanup")));
+	Blueprint->MarkAsGarbage();
 	return true;
 }
 
@@ -496,20 +584,18 @@ bool FTagToolboxClipboardTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Unregistered name classifies Invalid"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("Zzz.NotARealTag.Ever"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Invalid));
 	TestEqual(TEXT("Bare None classifies Invalid (paste never clears implicitly)"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("None"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::Invalid));
 
-	// Registered-name parsing needs a real host tag; skip cleanly when absent.
-	const FGameplayTag HostTag = TagToolboxTest_RequestTag(TEXT("Paper2DPlus.Animation"));
-	if (HostTag.IsValid())
+	const FTagToolboxTestTagHierarchy Tags;
+	const FGameplayTag AnimationTag = Tags.Animation();
+	if (!TestTrue(TEXT("clipboard fixture tag registered on demand"), AnimationTag.IsValid()))
 	{
-		TestEqual(TEXT("Plain registered name classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("Paper2DPlus.Animation"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
-		TestEqual(TEXT("Plain name parses to the tag"), Parsed, HostTag);
-		TestEqual(TEXT("Export form classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("(TagName=\"Paper2DPlus.Animation\")"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
-		TestEqual(TEXT("Export form parses to the tag"), Parsed, HostTag);
-		TestEqual(TEXT("Surrounding whitespace tolerated"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("  Paper2DPlus.Animation  "), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+		return false;
 	}
-	else
-	{
-		AddInfo(TEXT("Skipping registered-name parse checks: Paper2DPlus.Animation is not registered in this host."));
-	}
+	// Registered-name parsing uses the automation-local fixture, not host project vocabulary.
+	TestEqual(TEXT("Plain registered name classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("TagToolbox.Test.Animation"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+	TestEqual(TEXT("Plain name parses to the tag"), Parsed, AnimationTag);
+	TestEqual(TEXT("Export form classifies SingleTag"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("(TagName=\"TagToolbox.Test.Animation\")"), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
+	TestEqual(TEXT("Export form parses to the tag"), Parsed, AnimationTag);
+	TestEqual(TEXT("Surrounding whitespace tolerated"), static_cast<int32>(FTagToolboxTagClipboard::ClassifyClipboardText(TEXT("  TagToolbox.Test.Animation  "), Parsed)), static_cast<int32>(ETagToolboxClipboardContent::SingleTag));
 
 	// Filter matching (the shared create/paste policy).
 	TestTrue(TEXT("Empty filter allows everything"), FTagToolboxTagClipboard::NameMatchesFilter(TEXT("Anything.At.All"), TEXT("")));

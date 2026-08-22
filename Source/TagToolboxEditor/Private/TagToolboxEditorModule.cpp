@@ -1,6 +1,7 @@
 // Copyright Infinite Game Works. All Rights Reserved.
 
 #include "TagToolboxEditorModule.h"
+#include "TagToolboxUndo.h"
 
 #include "BlueprintEditorModule.h"
 #include "Editor.h"
@@ -108,6 +109,11 @@ void FTagToolboxEditorModule::ShutdownModule()
 	UnregisterTagPillCustomization();
 	UnregisterCommentTintFactory();
 	UnregisterTabs();
+	if (UndoClient)
+	{
+		UndoClient->Unregister();
+		UndoClient.Reset();
+	}
 	FTagToolboxTagScanService::Shutdown();
 }
 
@@ -137,6 +143,8 @@ void FTagToolboxEditorModule::PerformDeferredStartup()
 	}
 	bDeferredStartupDone = true;
 
+	UndoClient = MakeUnique<FTagToolboxUndoClient>();
+	UndoClient->Register();
 	RegisterVariableCustomizations();
 	RegisterCommentTintFactory();
 	RegisterTabs();

@@ -1,6 +1,7 @@
 // Copyright Infinite Game Works. All Rights Reserved.
 
 #include "TagToolboxTagRootsChildRow.h"
+#include "TagToolboxUndo.h"
 
 #include "DetailWidgetRow.h"
 #include "Engine/Blueprint.h"
@@ -83,14 +84,9 @@ void FTagToolboxTagRootsChildRow::OnCategoriesComboClosed(const FGameplayTagCont
 
 	if (UBlueprint* CreatorBPPtr = CreatorBP.Get())
 	{
-		if (!MetaDataCategories.IsEmpty())
-		{
-			FBlueprintEditorUtils::SetBlueprintVariableMetaData(CreatorBPPtr, Property->GetFName(), Property->GetOwner<UFunction>(), TEXT("Categories"), ContainerString);
-		}
-		else
-		{
-			FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(CreatorBPPtr, Property->GetFName(), Property->GetOwner<UFunction>(), TEXT("Categories"));
-		}
+		// Undoable (the engine setter alone records nothing).
+		TagToolboxUndo::SetVariableCategories(CreatorBPPtr, Property->GetFName(), Property->GetOwner<UFunction>(),
+			MetaDataCategories.IsEmpty() ? FString() : ContainerString);
 	}
 	else
 	{

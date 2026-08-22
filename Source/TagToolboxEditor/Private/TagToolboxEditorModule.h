@@ -46,6 +46,7 @@ private:
 	FDelegateHandle VariableCustomizationHandle;
 	FDelegateHandle LocalVariableCustomizationHandle;
 	TSharedPtr<class FTagToolboxCommentTintFactory> CommentTintFactory;
+	TUniquePtr<class FTagToolboxUndoClient> UndoClient;
 	bool bRegisteredTagPillCustomization = false;
 	bool bRegisteredTagContainerCustomization = false;
 	bool bRegisteredTabs = false;

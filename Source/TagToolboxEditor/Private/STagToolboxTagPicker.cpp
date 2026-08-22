@@ -1,6 +1,7 @@
 // Copyright Infinite Game Works. All Rights Reserved.
 
 #include "STagToolboxTagPicker.h"
+#include "TagToolboxUndo.h"
 
 #include "AssetRegistry/AssetIdentifier.h"
 #include "AssetRegistry/IAssetRegistry.h"
@@ -962,7 +963,7 @@ TSharedPtr<SWidget> STagToolboxTagPicker::BuildRowContextMenu()
 		FSlateIcon(),
 		FUIAction(FExecuteAction::CreateLambda([NodeTag]()
 		{
-			GetMutableDefault<UTagToolboxSettings>()->ClearTagColor(NodeTag);
+			TagToolboxUndo::ClearTagStyleTransacted(NodeTag);
 		})));
 
 	MenuBuilder.AddMenuEntry(
@@ -1275,10 +1276,15 @@ void STagToolboxTagPicker::OpenColorPickerForTag(FGameplayTag InTag)
 	FLinearColor InitialColor(0.5f, 0.5f, 0.5f);
 	GetDefault<UTagToolboxSettings>()->ResolveTagColor(InTag, InitialColor);
 
+	// One undo step per slider drag (begin/end bracket the transaction); a typed
+	// value outside a drag transacts on its own.
 	FColorPickerArgs PickerArgs(InitialColor, FOnLinearColorValueChanged::CreateLambda([InTag](FLinearColor NewColor)
 	{
-		GetMutableDefault<UTagToolboxSettings>()->SetTagColor(InTag, NewColor);
+		TagToolboxUndo::SetTagStyleTransacted(InTag, NewColor);
 	}));
+	PickerArgs.OnInteractivePickBegin = FSimpleDelegate::CreateLambda([InTag]() { TagToolboxUndo::BeginInteractiveStyleEdit(InTag); });
+	PickerArgs.OnInteractivePickEnd = FSimpleDelegate::CreateLambda([]() { TagToolboxUndo::EndInteractiveStyleEdit(); });
+	PickerArgs.OnColorPickerWindowClosed = FOnWindowClosed::CreateLambda([](const TSharedRef<SWindow>&) { TagToolboxUndo::EndInteractiveStyleEdit(); });
 	PickerArgs.bUseAlpha = false;
 	OpenColorPicker(PickerArgs);
 }

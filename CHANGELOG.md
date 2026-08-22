@@ -1,5 +1,12 @@
 # Tag Toolbox Changelog
 
+## v0.2.1 — 2026-08-21
+
+### Fixed
+- **Undo/redo for variable tag filters.** Setting or clearing a Tag Filter / Gameplay Tag Roots on a Blueprint variable is now a real undo step (Ctrl+Z / Ctrl+Y). The engine's `SetBlueprintVariableMetaData` records nothing on its own — which is also why the stock 5.7+ Roots row was never undoable — so the plugin now transacts the Blueprint (and the function-entry node for local variables) and regenerates the skeleton after undo/redo so the picker's filter visibly reverts, not just the stored metadata.
+- **Undo/redo for tag colors.** Set Color (one undo step per slider drag, not one per mouse move) and Clear Color are transactional; undo/redo re-persists the default config and re-notifies every pill, so the editor, the ini, and the chips never disagree.
+- Operations that rewrite the tag inis — create, rename, delete, redirects, and resave — remain deliberately outside the undo buffer (the engine's tag table has no transactional form); each keeps its own confirmation, preview, and rollback path instead.
+
 ## v0.2.0 — 2026-08-21
 
 ### Fixed

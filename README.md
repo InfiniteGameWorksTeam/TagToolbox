@@ -2,7 +2,7 @@
 
 A quality-of-life suite for Unreal Engine's Gameplay Tags, aimed at the gap between "tags are the backbone of modern UE projects" and "the editor gives designers almost no tooling for them."
 
-**Status: pre-release (0.2.0, in development).** Developed against UE 5.8; broader engine-range support is planned.
+**Status: pre-release (0.2.1, in development).** Developed against UE 5.8; broader engine-range support is planned.
 
 ## Install
 
